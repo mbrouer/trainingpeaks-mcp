@@ -1203,7 +1203,9 @@ TOOLS = [
         name="tp_schedule_library_workout",
         description=(
             "Schedule a library template to a calendar date, for yourself or "
-            "(coach accounts) for one or many athletes."
+            "(coach accounts) for one or many athletes. Optionally adjust the "
+            "scheduled copy — interval reps, total duration, or description — "
+            "without editing the template itself."
         ),
         input_schema={
             "type": "object",
@@ -1219,6 +1221,29 @@ TOOLS = [
                         "schedule the same template to, one workout each. "
                         "Returns per-athlete results. Mutually exclusive with "
                         "'athlete'."
+                    ),
+                },
+                "description_override": {
+                    "type": "string",
+                    "description": (
+                        "Replace the template's description text on the "
+                        "scheduled workout. The template itself is unchanged."
+                    ),
+                },
+                "interval_reps_override": {
+                    "type": "integer",
+                    "description": (
+                        "Number of reps for the template's main interval set, "
+                        "e.g. schedule 6 reps from a 5-rep template. Ignored for "
+                        "templates without a repetition structure."
+                    ),
+                },
+                "endurance_minutes_override": {
+                    "type": "number",
+                    "description": (
+                        "Total planned duration in minutes. The work portion is "
+                        "scaled to hit it while warm-up/cool-down stay fixed; "
+                        "planned time and TSS are recomputed to match."
                     ),
                 },
             },
@@ -2028,6 +2053,9 @@ async def _h_schedule_lib(args):
     return await tp_schedule_library_workout(
         library_id=args["library_id"], item_id=args["item_id"], date=args["date"],
         athletes=args.get("athletes"),
+        description_override=args.get("description_override"),
+        interval_reps_override=args.get("interval_reps_override"),
+        endurance_minutes_override=args.get("endurance_minutes_override"),
     )
 
 

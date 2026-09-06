@@ -1,5 +1,6 @@
 """Workout library tools: templates, scheduling."""
 
+import copy
 import json
 import logging
 from typing import Any
@@ -87,6 +88,130 @@ def _ensure_structure_preview(structure: Any) -> Any:
         if poly:
             out["polyline"] = poly
     return out
+
+
+def _block_reps(block: dict[str, Any]) -> int:
+    """Repetition count for a block (1 for a single-step block)."""
+    if block.get("type") == "repetition":
+        return int((block.get("length") or {}).get("value", 1) or 1)
+    return 1
+
+
+def _step_seconds(block: dict[str, Any]) -> int:
+    """Total seconds of one pass through a block's steps (before reps)."""
+    total = 0
+    for s in block.get("steps", []):
+        total += int((s.get("length") or {}).get("value", 0) or 0)
+    return total
+
+
+def _recompute_begin_end(blocks: list[dict[str, Any]]) -> int:
+    """Rewrite each block's cumulative ``begin``/``end`` from its own step
+    durations and rep count. Returns the structure's total seconds."""
+    cursor = 0
+    for b in blocks:
+        duration = _step_seconds(b) * _block_reps(b)
+        b["begin"] = cursor
+        cursor += duration
+        b["end"] = cursor
+    return cursor
+
+
+def _primary_repetition_block(
+    blocks: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """The template's main interval set: the ``repetition`` block with the most
+    reps (ties broken by longest per-pass duration). ``None`` when the structure
+    has no repetition block (e.g. a plain endurance ride)."""
+    reps = [b for b in blocks if b.get("type") == "repetition"]
+    if not reps:
+        return None
+    return max(
+        reps,
+        key=lambda b: ((b.get("length") or {}).get("value", 0) or 0, _step_seconds(b)),
+    )
+
+
+def _set_total_duration(blocks: list[dict[str, Any]], target_seconds: int) -> None:
+    """Scale the workout so its total planned time equals ``target_seconds``.
+
+    Warm-up, cool-down and rest steps are treated as fixed anchors; the
+    remaining ``active``/``other`` work steps are scaled proportionally to
+    absorb the change. When nothing is marked as work (e.g. a single untyped
+    endurance step), every step is scaled uniformly instead."""
+    def _classify() -> tuple[list[tuple[dict[str, Any], int]], int, int]:
+        work: list[tuple[dict[str, Any], int]] = []
+        work_secs = 0
+        fixed_secs = 0
+        for b in blocks:
+            reps = _block_reps(b)
+            for s in b.get("steps", []):
+                dur = int((s.get("length") or {}).get("value", 0) or 0)
+                if s.get("intensityClass") in ("warmUp", "coolDown", "rest"):
+                    fixed_secs += dur * reps
+                else:
+                    work.append((s, reps))
+                    work_secs += dur * reps
+        return work, work_secs, fixed_secs
+
+    work, work_secs, fixed_secs = _classify()
+    if not work or work_secs <= 0:
+        # No dedicated work steps — scale everything uniformly.
+        work = [(s, _block_reps(b)) for b in blocks for s in b.get("steps", [])]
+        work_secs = sum(
+            int((s.get("length") or {}).get("value", 0) or 0) * reps
+            for s, reps in work
+        )
+        fixed_secs = 0
+    if work_secs <= 0:
+        return
+    budget = max(target_seconds - fixed_secs, len(work))
+    factor = budget / work_secs
+    for step, _reps in work:
+        length = step.setdefault("length", {})
+        length["value"] = max(int(round((length.get("value", 0) or 0) * factor)), 1)
+        length.setdefault("unit", "second")
+
+
+def _apply_structure_overrides(
+    structure: Any,
+    *,
+    interval_reps: int | None = None,
+    endurance_minutes: float | None = None,
+) -> tuple[Any, int | None]:
+    """Return a COPY of a native template structure with its main interval rep
+    count and/or total duration adjusted, plus the resulting total seconds.
+
+    ``begin``/``end`` offsets and the preview ``polyline`` are recomputed so the
+    scheduled workout renders correctly. Non-native or empty structures (and the
+    no-override case) are returned untouched with ``total_seconds=None``."""
+    if interval_reps is None and endurance_minutes is None:
+        return structure, None
+    if not isinstance(structure, dict):
+        return structure, None
+    blocks = structure.get("structure")
+    if not isinstance(blocks, list) or not blocks:
+        return structure, None
+
+    out = dict(structure)
+    blocks = copy.deepcopy(blocks)
+    out["structure"] = blocks
+
+    if interval_reps is not None:
+        rep_block = _primary_repetition_block(blocks)
+        if rep_block is not None:
+            length = rep_block.setdefault("length", {})
+            length["value"] = int(interval_reps)
+            length.setdefault("unit", "repetition")
+
+    if endurance_minutes is not None:
+        _set_total_duration(blocks, int(round(endurance_minutes * 60)))
+
+    total_seconds = _recompute_begin_end(blocks)
+    poly = _compute_native_polyline(blocks)
+    if poly:
+        out["polyline"] = poly
+    return out, total_seconds
 
 
 async def tp_get_libraries() -> dict[str, Any]:
@@ -550,30 +675,78 @@ async def tp_update_library_item(
 
 
 def _template_workout_payload(
-    item: dict[str, Any], date: str, athlete_id: int
+    item: dict[str, Any],
+    date: str,
+    athlete_id: int,
+    *,
+    description_override: str | None = None,
+    interval_reps_override: int | None = None,
+    endurance_minutes_override: float | None = None,
 ) -> dict[str, Any]:
-    """Build the planned-workout payload that copies a library template."""
+    """Build the planned-workout payload that copies a library template.
+
+    Optional adjustments let a caller schedule a variant of the template
+    without editing the library item itself:
+
+    * ``interval_reps_override`` — set the number of reps in the template's main
+      interval set (e.g. schedule 6×3min from a 5×3min template).
+    * ``endurance_minutes_override`` — set the total planned duration in minutes,
+      scaling the work portion while keeping warm-up/cool-down fixed.
+    * ``description_override`` — replace the template's description text.
+
+    When an interval/duration adjustment changes the structure, ``begin``/
+    ``end``, the preview polyline, ``totalTimePlanned`` and (proportionally,
+    since IF is unchanged) ``tssPlanned`` are recomputed to match.
+    """
     sport_id = item.get("workoutTypeId")
+    structure = item.get("structure")
+    total_planned = item.get("totalTimePlanned")
+    tss_planned = item.get("tssPlanned")
+
+    if structure and (
+        interval_reps_override is not None or endurance_minutes_override is not None
+    ):
+        structure, total_seconds = _apply_structure_overrides(
+            structure,
+            interval_reps=interval_reps_override,
+            endurance_minutes=endurance_minutes_override,
+        )
+        if total_seconds:
+            new_hours = round(total_seconds / 3600, 4)
+            # Keep planned TSS consistent: at unchanged intensity, TSS scales
+            # linearly with duration.
+            if (
+                isinstance(tss_planned, (int, float))
+                and isinstance(total_planned, (int, float))
+                and total_planned > 0
+            ):
+                tss_planned = round(tss_planned * (new_hours / total_planned), 1)
+            total_planned = new_hours
+
+    description = item.get("description")
+    if description_override is not None and description_override.strip():
+        description = description_override
+
     payload: dict[str, Any] = {
         "athleteId": athlete_id,
         "workoutDay": f"{date}T00:00:00",
         "workoutTypeFamilyId": sport_id,
         "workoutTypeValueId": sport_id,
         "title": item.get("itemName"),
-        "totalTimePlanned": item.get("totalTimePlanned"),
-        "tssPlanned": item.get("tssPlanned"),
+        "totalTimePlanned": total_planned,
+        "tssPlanned": tss_planned,
         "ifPlanned": item.get("ifPlanned"),
         "distancePlanned": item.get("distancePlanned"),
         "elevationGainPlanned": item.get("elevationGainPlanned"),
         "caloriesPlanned": item.get("caloriesPlanned"),
-        "description": item.get("description"),
+        "description": description,
         "coachComments": item.get("coachComments"),
     }
     if item.get("workoutSubTypeId") is not None:
         payload["workoutSubTypeId"] = item["workoutSubTypeId"]
-    if item.get("structure"):
+    if structure:
         # Calendar workouts carry structure as a JSON string
-        payload["structure"] = json.dumps(item["structure"])
+        payload["structure"] = json.dumps(structure)
     return payload
 
 
@@ -582,6 +755,9 @@ async def tp_schedule_library_workout(
     item_id: str,
     date: str,
     athletes: list[str] | None = None,
+    description_override: str | None = None,
+    interval_reps_override: int | None = None,
+    endurance_minutes_override: float | None = None,
 ) -> dict[str, Any]:
     """Schedule a library template to a calendar date.
 
@@ -598,6 +774,15 @@ async def tp_schedule_library_workout(
         athletes: Optional list of athlete names or IDs (coach accounts) to
             schedule the same template to several athletes in one call.
             Mutually exclusive with the ``athlete`` targeting parameter.
+        description_override: Optional text that replaces the template's
+            description on the scheduled workout (the template itself is left
+            unchanged).
+        interval_reps_override: Optional number of reps for the template's main
+            interval set, e.g. schedule 6 reps from a 5-rep template. Ignored
+            for templates with no repetition structure.
+        endurance_minutes_override: Optional total planned duration in minutes.
+            The work portion is scaled to hit it while warm-up/cool-down stay
+            fixed; ``totalTimePlanned``/``tssPlanned`` are recomputed to match.
 
     Returns:
         Dict with confirmation (including new workout_id) or error. In bulk
@@ -625,6 +810,34 @@ async def tp_schedule_library_workout(
             "error_code": "VALIDATION_ERROR",
             "message": f"Invalid date: {date}",
         }
+
+    if interval_reps_override is not None and (
+        not isinstance(interval_reps_override, int)
+        or isinstance(interval_reps_override, bool)
+        or interval_reps_override <= 0
+    ):
+        return {
+            "isError": True,
+            "error_code": "VALIDATION_ERROR",
+            "message": "interval_reps_override must be a positive integer.",
+        }
+
+    if endurance_minutes_override is not None and (
+        not isinstance(endurance_minutes_override, (int, float))
+        or isinstance(endurance_minutes_override, bool)
+        or endurance_minutes_override <= 0
+    ):
+        return {
+            "isError": True,
+            "error_code": "VALIDATION_ERROR",
+            "message": "endurance_minutes_override must be a positive number of minutes.",
+        }
+
+    overrides: dict[str, Any] = {
+        "description_override": description_override,
+        "interval_reps_override": interval_reps_override,
+        "endurance_minutes_override": endurance_minutes_override,
+    }
 
     if athletes is not None:
         if athlete_override.get() is not None:
@@ -691,12 +904,13 @@ async def tp_schedule_library_workout(
             }
 
         if athletes is not None:
-            return await _schedule_item_bulk(client, item, date, athletes)
+            return await _schedule_item_bulk(client, item, date, athletes, overrides)
 
         assert athlete_id is not None  # resolved above in the single-athlete path
         endpoint = f"/fitness/v6/athletes/{athlete_id}/workouts"
         response = await client.post(
-            endpoint, json=_template_workout_payload(item, date, athlete_id)
+            endpoint,
+            json=_template_workout_payload(item, date, athlete_id, **overrides),
         )
 
         if response.is_error:
@@ -720,15 +934,21 @@ async def tp_schedule_library_workout(
 
 
 async def _schedule_item_bulk(
-    client: TPClient, item: dict[str, Any], date: str, athletes: list[str]
+    client: TPClient,
+    item: dict[str, Any],
+    date: str,
+    athletes: list[str],
+    overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Schedule one library template to several athletes, sequentially.
 
     Each entry is resolved exactly as the single ``athlete`` targeting
     parameter would be (name or ID, via the athlete_override context var).
     Follows the groups-tools partial-failure pattern: per-athlete ``errors``,
-    ``isError`` only when EVERY athlete failed.
+    ``isError`` only when EVERY athlete failed. Any ``overrides`` (description /
+    interval reps / duration) are applied identically to every athlete.
     """
+    overrides = overrides or {}
     scheduled: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
@@ -753,7 +973,8 @@ async def _schedule_item_bulk(
 
         endpoint = f"/fitness/v6/athletes/{athlete_id}/workouts"
         response = await client.post(
-            endpoint, json=_template_workout_payload(item, date, athlete_id)
+            endpoint,
+            json=_template_workout_payload(item, date, athlete_id, **overrides),
         )
         if response.is_error:
             errors.append({
