@@ -711,6 +711,20 @@ class TestApplyStructureOverrides:
         # Source untouched (deep copy)
         assert self.INTERVAL_STRUCTURE["structure"][1]["length"]["value"] == 5
 
+    def test_interval_reps_zero_removes_set(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, interval_reps={0: 0}
+        )
+        blocks = out["structure"]
+        # The repetition block is dropped, leaving warm-up + cool-down only.
+        assert len(blocks) == 2
+        assert all(b.get("type") != "repetition" for b in blocks)
+        # total = warm-up 600 + cool-down 300 = 900
+        assert total == 900
+        # Source untouched (deep copy)
+        assert len(self.INTERVAL_STRUCTURE["structure"]) == 3
+
     def test_interval_reps_and_duration_applies_reps_first(self):
         from tp_mcp.tools.library import _apply_structure_overrides
         out, total = _apply_structure_overrides(
@@ -858,7 +872,7 @@ class TestScheduleWithOverrides:
         for bad in (
             [1, 2, 3],          # non-dict
             {"0": True},        # bool value
-            {"0": 0},           # below 1
+            {"0": -1},          # below 0
             {"0": 101},         # above 100
             {"0": 3.5},         # non-integer
             {"foo": 3},         # non-integer key

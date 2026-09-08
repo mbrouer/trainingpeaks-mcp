@@ -223,18 +223,27 @@ def _set_block_reps(
 ) -> None:
     """Rewrite the rep count (``length.value``) of each targeted repetition
     block. ``reps_by_ordinal`` is keyed by repetition-block ordinal (0-based,
-    counting only ``type:"repetition"`` blocks in structure order). Non-
-    repetition blocks and ordinals not present in the map are left untouched.
-    Mirrors the TS ``setBlockReps`` helper."""
+    counting only ``type:"repetition"`` blocks in structure order). A rep count
+    of 0 REMOVES the whole interval set (that repetition block) from the
+    structure. Non-repetition blocks and ordinals not present in the map are
+    left untouched. Mirrors the TS ``setBlockReps`` helper."""
     ord_ = 0
-    for b in blocks:
+    i = 0
+    while i < len(blocks):
+        b = blocks[i]
         if b.get("type") == "repetition":
             v = reps_by_ordinal.get(ord_)
-            if isinstance(v, int) and not isinstance(v, bool) and v >= 1:
+            if isinstance(v, int) and not isinstance(v, bool):
+                if v <= 0:
+                    # Rep count 0 → drop the entire interval set.
+                    blocks.pop(i)
+                    ord_ += 1
+                    continue  # list shifted; don't advance ``i``
                 length = b.setdefault("length", {})
                 length["value"] = int(v)
                 length.setdefault("unit", "repetition")
             ord_ += 1
+        i += 1
 
 
 def _apply_structure_overrides(
@@ -852,7 +861,8 @@ async def tp_schedule_library_workout(
             ``totalTimePlanned``/``tssPlanned`` are recomputed to match.
         interval_reps_override: Optional map of repetition-block ordinal
             (0-based, counting only repetition blocks in structure order) to a
-            new rep count (1..100). Only listed blocks change; unlisted blocks
+            new rep count (0..100, where 0 removes that interval set). Only
+            listed blocks change; unlisted blocks
             keep the template's reps. Combinable with
             ``endurance_minutes_override`` (reps are applied first);
             ``totalTimePlanned``/``tssPlanned`` are recomputed to match. The
@@ -903,7 +913,7 @@ async def tp_schedule_library_workout(
             "error_code": "VALIDATION_ERROR",
             "message": (
                 "interval_reps_override must map repetition-block indices to "
-                "integer rep counts between 1 and 100."
+                "integer rep counts between 0 and 100 (0 removes the set)."
             ),
         }
         if not isinstance(interval_reps_override, dict):
@@ -916,7 +926,7 @@ async def tp_schedule_library_workout(
             if (
                 not isinstance(value, int)
                 or isinstance(value, bool)
-                or value < 1
+                or value < 0
                 or value > 100
             ):
                 return reps_err
