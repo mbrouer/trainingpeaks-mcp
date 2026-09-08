@@ -153,64 +153,138 @@ def _scale_work_steps(blocks: list[dict[str, Any]], target_seconds: int) -> None
     factor = budget / work_secs
     for step, _reps in work:
         length = step.setdefault("length", {})
-        length["value"] = max(int(round((length.get("value", 0) or 0) * factor)), 1)
+        length["value"] = _round_to_half_minute(
+            (length.get("value", 0) or 0) * factor
+        )
+        length.setdefault("unit", "second")
+
+
+# Minimum duration (seconds) protected for the opening warm-up AND the closing
+# cool-down block (the two edge blocks).
+_EDGE_BLOCK_MIN_SECONDS = 600  # 10 min
+
+
+def _round_to_half_minute(seconds: float) -> int:
+    """Snap an adjusted duration to a clean half/whole minute so the plan never
+    shows odd times like 10:27. A minute or more rounds to the nearest 30s
+    (e.g. 627 → 630 = 10:30); sub-minute leftovers keep their whole-second value
+    so short recovery bits are not inflated up to 30s. Only the flexed/scaled
+    durations are rounded — untouched interval efforts keep their exact length."""
+    if seconds < 60:
+        return max(int(round(seconds)), 1)
+    return int(round(seconds / 30)) * 30
+
+
+def _scale_flex_to_budget(
+    flex: list[tuple[dict[str, Any], int, int]], budget: float
+) -> None:
+    """Distribute ``budget`` seconds across the flexible steps, scaling them by a
+    single factor BUT never letting any step drop below its own floor. Uses
+    water-filling: on each pass, steps whose scaled length would fall under their
+    floor are pinned at the floor and removed from the pool, and the remaining
+    budget is re-shared across the rest. This keeps the reduction proportional
+    while honouring per-step minimums (e.g. the 10-min opening warm-up / closing
+    cool-down), instead of one big pool crushing every flexible step toward 1s."""
+    entries: list[dict[str, Any]] = []
+    for step, reps, floor in flex:
+        dur = int((step.get("length") or {}).get("value", 0) or 0)
+        entries.append(
+            {
+                "step": step,
+                "reps": reps,
+                "floor": max(floor, 1),
+                "dur": dur,
+                "value": None,
+            }
+        )
+
+    remaining = budget
+    while True:
+        active = [x for x in entries if x["value"] is None]
+        scalable = sum(x["dur"] * x["reps"] for x in active)
+        if not active or scalable <= 0:
+            break
+        factor = remaining / scalable
+        # Pin every step that would fall below its floor at this factor, then
+        # retry with the leftover budget spread across the still-flexible steps.
+        pinned = [x for x in active if x["dur"] * factor < x["floor"]]
+        if not pinned:
+            for x in active:
+                x["value"] = max(int(round(x["dur"] * factor)), 1)
+            break
+        for x in pinned:
+            x["value"] = x["floor"]
+            remaining -= x["floor"] * x["reps"]
+
+    for x in entries:
+        length = x["step"].setdefault("length", {})
+        length["value"] = _round_to_half_minute(
+            x["value"] if x["value"] is not None else x["floor"]
+        )
         length.setdefault("unit", "second")
 
 
 def _set_total_duration(blocks: list[dict[str, Any]], target_seconds: int) -> None:
     """Scale the workout so its total planned time equals ``target_seconds``.
 
-    The MAIN INTERVALS stay fixed. Concretely, every non-``rest`` effort inside a
-    ``repetition`` block (e.g. ``5×(3:40 VT-2 + 0:20 VO₂)``) is treated as an
-    untouchable interval, and so are the warm-up/cool-down. The duration change
-    is absorbed entirely by the flexible pool — ``rest`` steps anywhere plus
-    standalone steady/endurance steps (non-``rest`` ``active``/``other`` steps
-    that are NOT inside a repetition block). This matches the coach's intent: a
-    "make it longer/shorter" tweak stretches the recovery/endurance, never the
-    hard interval efforts.
+    The MAIN INTERVALS stay fixed. Concretely, EVERY step inside a ``repetition``
+    block — both the hard effort AND the short in-set recovery between reps
+    (e.g. ``5×(3:40 VT-2 + 0:20 VO₂)``) — is treated as an untouchable interval,
+    so interval timing is never stretched or squashed (a 20s VO₂ stays 20s, not
+    18s). The duration change is absorbed only by the flexible pool: standalone
+    ``rest`` recovery blocks between sets, standalone steady/endurance steps, and
+    mid-workout "easy" recovery blocks. This matches the coach's intent: a "make
+    it longer/shorter" tweak stretches the recovery/endurance, never the efforts.
 
-    When the target is shorter than the fixed intervals + warm-up/cool-down, the
-    flexible steps collapse toward their 1-second minimum (intervals still stay
-    fixed) rather than compressing the efforts.
+    Only a LEADING ``warmUp`` block and a TRAILING ``coolDown`` block are treated
+    as fixed anchors (the true warm-up / cool-down). A low-intensity block in the
+    middle of the workout — even if TrainingPeaks tags it ``warmUp``/``coolDown``
+    — is really between-set recovery, so it flexes with the rest of the pool.
+
+    The flexible pool is shrunk/grown by water-filling (``_scale_flex_to_budget``)
+    so the reduction spreads proportionally while honouring per-step minimums. In
+    particular the FIRST and LAST blocks keep a 10-minute floor so the opening
+    warm-up and closing cool-down are never squashed to a few seconds. Scaled
+    durations snap to clean half/whole minutes.
 
     Falls back to scaling the work steps (``_scale_work_steps``) only when there
     is no flexible pool at all — a workout made purely of repetition intervals
     and/or warm-up/cool-down, where nothing else can move."""
-    flex: list[tuple[dict[str, Any], int]] = []
-    flex_secs = 0  # rest + standalone steady/endurance — absorbs the change
-    interval_secs = 0  # non-rest efforts inside repetition blocks — fixed
-    anchor_secs = 0  # warm-up/cool-down — fixed
-    for b in blocks:
+    flex: list[tuple[dict[str, Any], int, int]] = []  # (step, reps, floor)
+    interval_secs = 0  # every step inside repetition blocks — fixed
+    anchor_secs = 0  # leading warm-up / trailing cool-down — fixed
+    last_idx = len(blocks) - 1
+    for idx, b in enumerate(blocks):
         reps = _block_reps(b)
         is_repetition = b.get("type") == "repetition"
+        is_edge_block = idx == 0 or idx == last_idx
         for s in b.get("steps", []):
             dur = int((s.get("length") or {}).get("value", 0) or 0)
             cls = s.get("intensityClass")
-            if cls == "rest":
-                flex.append((s, reps))
-                flex_secs += dur * reps
-            elif cls in ("warmUp", "coolDown"):
-                anchor_secs += dur * reps
-            elif is_repetition:
-                # Main interval effort — never scaled.
+            is_warm_cool = cls in ("warmUp", "coolDown")
+            if is_repetition:
+                # Main interval set — EVERY step (hard effort AND the short in-set
+                # recovery between reps, e.g. the 20s VO₂) stays fixed.
                 interval_secs += dur * reps
+            elif is_warm_cool and is_edge_block:
+                # True warm-up / cool-down at the very start/end — never scaled.
+                anchor_secs += dur * reps
+            elif cls == "rest":
+                # Standalone recovery block between sets — flexible.
+                flex.append((s, reps, 1))
             else:
-                # Standalone steady/endurance step — flexible.
-                flex.append((s, reps))
-                flex_secs += dur * reps
+                # Standalone steady/endurance/easy step — flexible. Protect the
+                # opening warm-up AND closing cool-down (the edge blocks) with a
+                # 10-minute floor (capped at the step's original length so we
+                # never invent time for an already-short block).
+                floor = min(dur, _EDGE_BLOCK_MIN_SECONDS) if is_edge_block else 1
+                flex.append((s, reps, floor))
 
-    # Preferred: keep intervals + warm-up/cool-down fixed, absorb the delta in
-    # the flexible pool. When the target is too short the factor goes to/below
-    # zero and each flexible step floors at 1s — the intervals still never move.
-    if flex and flex_secs > 0:
+    # Preferred: keep intervals + true warm-up/cool-down fixed, absorb the delta
+    # across the flexible pool via water-filling (proportional, floor-aware).
+    if flex:
         budget = target_seconds - interval_secs - anchor_secs
-        factor = budget / flex_secs
-        for step, _reps in flex:
-            length = step.setdefault("length", {})
-            length["value"] = max(
-                int(round((length.get("value", 0) or 0) * factor)), 1
-            )
-            length.setdefault("unit", "second")
+        _scale_flex_to_budget(flex, budget)
         return
 
     # Fallback: nothing flexible (pure intervals and/or warm-up/cool-down) —
