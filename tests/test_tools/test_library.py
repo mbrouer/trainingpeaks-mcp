@@ -725,6 +725,71 @@ class TestApplyStructureOverrides:
         # Source untouched (deep copy)
         assert len(self.INTERVAL_STRUCTURE["structure"]) == 3
 
+    def test_interval_reps_zero_removes_trailing_rest_block(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        structure = {
+            "structure": [
+                _single(0, 600, _step("Warm up", 600, 45, 55, "warmUp")),
+                _repetition(600, 2100, 5, [
+                    _step("Work", 180, 88, 93, "active"),
+                    _step("Rest", 120, 40, 50, "rest"),
+                ]),
+                _single(2100, 2400, _step("Recovery", 300, 40, 50, "rest")),
+                _repetition(2400, 3900, 5, [
+                    _step("Work", 180, 88, 93, "active"),
+                    _step("Rest", 120, 40, 50, "rest"),
+                ]),
+                _single(3900, 4200, _step("Cool down", 300, 45, 55, "coolDown")),
+            ],
+        }
+        out, _ = _apply_structure_overrides(structure, interval_reps={0: 0})
+        blocks = out["structure"]
+        # First interval set AND the recovery block right after it are removed.
+        assert [b["steps"][0]["name"] for b in blocks] == [
+            "Warm up",
+            "Work",
+            "Cool down",
+        ]
+        assert blocks[1]["type"] == "repetition"  # second set survives
+
+    def test_interval_reps_zero_removes_easy_warmup_recovery(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        # Real-world shape: sets separated by an "Easy" recovery that TP tags
+        # warmUp. Dropping the middle set must also drop its trailing recovery.
+        structure = {
+            "structure": [
+                _single(0, 1800, _step("Aerobic", 1800, 60, 70, "active")),
+                _repetition(1800, 3000, 5, [
+                    _step("VT-2", 220, 90, 92, "active"),
+                    _step("Vo2", 20, 110, 120, "rest"),
+                ]),
+                _single(3000, 4200, _step("Easy", 1200, 40, 50, "warmUp")),
+                _repetition(4200, 5400, 5, [
+                    _step("VT-2", 220, 90, 92, "active"),
+                    _step("Vo2", 20, 110, 120, "rest"),
+                ]),
+                _single(5400, 6600, _step("Easy", 1200, 40, 50, "warmUp")),
+                _repetition(6600, 7800, 5, [
+                    _step("VT-2", 220, 90, 92, "active"),
+                    _step("Vo2", 20, 110, 120, "rest"),
+                ]),
+                _single(7800, 9000, _step("Aerobic tail", 1200, 60, 70, "active")),
+            ],
+        }
+        out, _ = _apply_structure_overrides(structure, interval_reps={1: 0})
+        names = [b["steps"][0]["name"] for b in out["structure"]]
+        assert names == ["Aerobic", "VT-2", "Easy", "VT-2", "Aerobic tail"]
+
+    def test_interval_reps_zero_preserves_trailing_cooldown(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, _ = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, interval_reps={0: 0}
+        )
+        # INTERVAL_STRUCTURE ends warm-up, set, cool-down: the cool-down is the
+        # final block and must survive when the set is dropped.
+        names = [b["steps"][0]["name"] for b in out["structure"]]
+        assert names == ["Warm up", "Cool down"]
+
     def test_interval_reps_and_duration_applies_reps_first(self):
         from tp_mcp.tools.library import _apply_structure_overrides
         out, total = _apply_structure_overrides(

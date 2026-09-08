@@ -218,6 +218,24 @@ def _set_total_duration(blocks: list[dict[str, Any]], target_seconds: int) -> No
     _scale_work_steps(blocks, target_seconds)
 
 
+def _is_recovery_block(block: dict[str, Any]) -> bool:
+    """True when ``block`` is a standalone recovery block: a non-``repetition``
+    block whose every step is low-intensity recovery — a ``rest`` step, or a
+    ``warmUp``/``coolDown`` step (mid-workout, these are really between-set
+    "easy" recovery, matching how ``_set_total_duration`` classifies non-edge
+    warm-up/cool-down blocks). A block containing any main-effort
+    (``active``/``other``) step is NOT recovery. Used to also drop the orphaned
+    recovery that follows an interval set removed via a 0 rep count."""
+    if block.get("type") == "repetition":
+        return False
+    steps = block.get("steps") or []
+    if not steps:
+        return False
+    return all(
+        s.get("intensityClass") in ("rest", "warmUp", "coolDown") for s in steps
+    )
+
+
 def _set_block_reps(
     blocks: list[dict[str, Any]], reps_by_ordinal: dict[int, int]
 ) -> None:
@@ -225,8 +243,10 @@ def _set_block_reps(
     block. ``reps_by_ordinal`` is keyed by repetition-block ordinal (0-based,
     counting only ``type:"repetition"`` blocks in structure order). A rep count
     of 0 REMOVES the whole interval set (that repetition block) from the
-    structure. Non-repetition blocks and ordinals not present in the map are
-    left untouched. Mirrors the TS ``setBlockReps`` helper."""
+    structure, along with the standalone recovery block immediately following it
+    (unless that recovery is the final block, i.e. a true trailing cool-down,
+    which is preserved). Non-repetition blocks and ordinals not present in the
+    map are left untouched. Mirrors the TS ``setBlockReps`` helper."""
     ord_ = 0
     i = 0
     while i < len(blocks):
@@ -235,8 +255,12 @@ def _set_block_reps(
             v = reps_by_ordinal.get(ord_)
             if isinstance(v, int) and not isinstance(v, bool):
                 if v <= 0:
-                    # Rep count 0 → drop the entire interval set.
+                    # Rep count 0 → drop the entire interval set...
                     blocks.pop(i)
+                    # ...and the orphaned recovery block after it, as long as it
+                    # is not the final block (a trailing cool-down stays put).
+                    if i < len(blocks) - 1 and _is_recovery_block(blocks[i]):
+                        blocks.pop(i)
                     ord_ += 1
                     continue  # list shifted; don't advance ``i``
                 length = b.setdefault("length", {})
