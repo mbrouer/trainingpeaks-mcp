@@ -1230,20 +1230,25 @@ TOOLS = [
                         "scheduled workout. The template itself is unchanged."
                     ),
                 },
-                "interval_reps_override": {
-                    "type": "integer",
-                    "description": (
-                        "Number of reps for the template's main interval set, "
-                        "e.g. schedule 6 reps from a 5-rep template. Ignored for "
-                        "templates without a repetition structure."
-                    ),
-                },
                 "endurance_minutes_override": {
                     "type": "number",
                     "description": (
                         "Total planned duration in minutes. The work portion is "
                         "scaled to hit it while warm-up/cool-down stay fixed; "
                         "planned time and TSS are recomputed to match."
+                    ),
+                },
+                "interval_reps_override": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer"},
+                    "description": (
+                        "Adjust interval/rep counts on the scheduled copy. Map "
+                        "each repetition block's index (0-based, counting only "
+                        "repetition blocks in structure order) to its new rep "
+                        "count, e.g. {\"0\": 13, \"1\": 3}. Unlisted blocks keep "
+                        "the template's reps. Combinable with "
+                        "endurance_minutes_override; planned time and TSS are "
+                        "recomputed. The template itself is unchanged."
                     ),
                 },
             },
@@ -2054,8 +2059,8 @@ async def _h_schedule_lib(args):
         library_id=args["library_id"], item_id=args["item_id"], date=args["date"],
         athletes=args.get("athletes"),
         description_override=args.get("description_override"),
-        interval_reps_override=args.get("interval_reps_override"),
         endurance_minutes_override=args.get("endurance_minutes_override"),
+        interval_reps_override=args.get("interval_reps_override"),
     )
 
 
