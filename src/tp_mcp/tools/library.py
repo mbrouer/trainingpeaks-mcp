@@ -117,13 +117,12 @@ def _recompute_begin_end(blocks: list[dict[str, Any]]) -> int:
     return cursor
 
 
-def _set_total_duration(blocks: list[dict[str, Any]], target_seconds: int) -> None:
-    """Scale the workout so its total planned time equals ``target_seconds``.
-
-    Warm-up, cool-down and rest steps are treated as fixed anchors; the
-    remaining ``active``/``other`` work steps are scaled proportionally to
-    absorb the change. When nothing is marked as work (e.g. a single untyped
-    endurance step), every step is scaled uniformly instead."""
+def _scale_work_steps(blocks: list[dict[str, Any]], target_seconds: int) -> None:
+    """Scale the ``active``/``other`` work steps to hit ``target_seconds``,
+    treating warm-up, cool-down and rest steps as fixed anchors. When nothing is
+    marked as work (e.g. a single untyped endurance step), every step is scaled
+    uniformly instead. Used as the fallback when a workout has no rest steps to
+    flex (see ``_set_total_duration``)."""
     def _classify() -> tuple[list[tuple[dict[str, Any], int]], int, int]:
         work: list[tuple[dict[str, Any], int]] = []
         work_secs = 0
@@ -156,6 +155,67 @@ def _set_total_duration(blocks: list[dict[str, Any]], target_seconds: int) -> No
         length = step.setdefault("length", {})
         length["value"] = max(int(round((length.get("value", 0) or 0) * factor)), 1)
         length.setdefault("unit", "second")
+
+
+def _set_total_duration(blocks: list[dict[str, Any]], target_seconds: int) -> None:
+    """Scale the workout so its total planned time equals ``target_seconds``.
+
+    The MAIN INTERVALS stay fixed. Concretely, every non-``rest`` effort inside a
+    ``repetition`` block (e.g. ``5×(3:40 VT-2 + 0:20 VO₂)``) is treated as an
+    untouchable interval, and so are the warm-up/cool-down. The duration change
+    is absorbed entirely by the flexible pool — ``rest`` steps anywhere plus
+    standalone steady/endurance steps (non-``rest`` ``active``/``other`` steps
+    that are NOT inside a repetition block). This matches the coach's intent: a
+    "make it longer/shorter" tweak stretches the recovery/endurance, never the
+    hard interval efforts.
+
+    When the target is shorter than the fixed intervals + warm-up/cool-down, the
+    flexible steps collapse toward their 1-second minimum (intervals still stay
+    fixed) rather than compressing the efforts.
+
+    Falls back to scaling the work steps (``_scale_work_steps``) only when there
+    is no flexible pool at all — a workout made purely of repetition intervals
+    and/or warm-up/cool-down, where nothing else can move."""
+    flex: list[tuple[dict[str, Any], int]] = []
+    flex_secs = 0  # rest + standalone steady/endurance — absorbs the change
+    interval_secs = 0  # non-rest efforts inside repetition blocks — fixed
+    anchor_secs = 0  # warm-up/cool-down — fixed
+    for b in blocks:
+        reps = _block_reps(b)
+        is_repetition = b.get("type") == "repetition"
+        for s in b.get("steps", []):
+            dur = int((s.get("length") or {}).get("value", 0) or 0)
+            cls = s.get("intensityClass")
+            if cls == "rest":
+                flex.append((s, reps))
+                flex_secs += dur * reps
+            elif cls in ("warmUp", "coolDown"):
+                anchor_secs += dur * reps
+            elif is_repetition:
+                # Main interval effort — never scaled.
+                interval_secs += dur * reps
+            else:
+                # Standalone steady/endurance step — flexible.
+                flex.append((s, reps))
+                flex_secs += dur * reps
+
+    # Preferred: keep intervals + warm-up/cool-down fixed, absorb the delta in
+    # the flexible pool. When the target is too short the factor goes to/below
+    # zero and each flexible step floors at 1s — the intervals still never move.
+    if flex and flex_secs > 0:
+        budget = target_seconds - interval_secs - anchor_secs
+        factor = budget / flex_secs
+        for step, _reps in flex:
+            length = step.setdefault("length", {})
+            length["value"] = max(
+                int(round((length.get("value", 0) or 0) * factor)), 1
+            )
+            length.setdefault("unit", "second")
+        return
+
+    # Fallback: nothing flexible (pure intervals and/or warm-up/cool-down) —
+    # scale the work steps as a last resort so a target can still be approached.
+    _scale_work_steps(blocks, target_seconds)
 
 
 def _set_block_reps(
@@ -694,7 +754,9 @@ def _template_workout_payload(
     without editing the library item itself:
 
     * ``endurance_minutes_override`` — set the total planned duration in minutes,
-      scaling the work portion while keeping warm-up/cool-down fixed.
+      absorbing the change in the rest periods while keeping the main interval
+      work and warm-up/cool-down fixed (falls back to scaling the work when the
+      workout has no rest to flex).
     * ``interval_reps_override`` — set new rep counts per repetition block (a map
       of block ordinal → rep count). Applied before duration scaling.
     * ``description_override`` — replace the template's description text.
@@ -784,8 +846,10 @@ async def tp_schedule_library_workout(
             description on the scheduled workout (the template itself is left
             unchanged).
         endurance_minutes_override: Optional total planned duration in minutes.
-            The work portion is scaled to hit it while warm-up/cool-down stay
-            fixed; ``totalTimePlanned``/``tssPlanned`` are recomputed to match.
+            The rest periods are stretched/shrunk to hit it while the main
+            interval work and warm-up/cool-down stay fixed (falling back to
+            scaling the work when there is no rest to flex);
+            ``totalTimePlanned``/``tssPlanned`` are recomputed to match.
         interval_reps_override: Optional map of repetition-block ordinal
             (0-based, counting only repetition blocks in structure order) to a
             new rep count (1..100). Only listed blocks change; unlisted blocks

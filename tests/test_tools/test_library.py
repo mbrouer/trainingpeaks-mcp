@@ -618,6 +618,67 @@ class TestApplyStructureOverrides:
         assert out["structure"][0]["steps"][0]["length"]["value"] == 1800
         assert total == 1800
 
+    def test_longer_duration_keeps_work_fixed_stretches_rest(self):
+        # 40min → 50min: work (180s) and warm-up/cool-down stay fixed; the 120s
+        # rest grows to 240s to absorb the extra 10 minutes.
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, endurance_minutes=50
+        )
+        blocks = out["structure"]
+        assert blocks[0]["steps"][0]["length"]["value"] == 600  # warm-up fixed
+        assert blocks[1]["steps"][0]["length"]["value"] == 180  # work UNCHANGED
+        assert blocks[1]["steps"][1]["length"]["value"] == 240  # rest 120 → 240
+        assert blocks[2]["steps"][0]["length"]["value"] == 300  # cool-down fixed
+        assert total == 3000
+
+    def test_shorter_duration_keeps_work_fixed_shrinks_rest(self):
+        # 40min → 35min: work stays 180s; rest shrinks from 120s to 60s.
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, endurance_minutes=35
+        )
+        blocks = out["structure"]
+        assert blocks[1]["steps"][0]["length"]["value"] == 180  # work UNCHANGED
+        assert blocks[1]["steps"][1]["length"]["value"] == 60   # rest 120 → 60
+        assert total == 2100
+
+    def test_very_short_target_keeps_intervals_fixed_collapses_rest(self):
+        # Target shorter than intervals + warm-up/cool-down: work efforts stay
+        # put and the rest collapses toward its minimum, never compressing.
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, _ = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, endurance_minutes=20
+        )
+        blocks = out["structure"]
+        assert blocks[1]["steps"][0]["length"]["value"] == 180  # work UNCHANGED
+        assert blocks[1]["steps"][1]["length"]["value"] < 120   # rest collapsed
+
+    def test_repetition_intervals_fixed_endurance_filler_absorbs_change(self):
+        # Mirrors the reported case: 5×(3:40 VT-2 + 0:20 VO₂) with NO rest inside
+        # the block. A separate endurance step flexes; the efforts stay fixed.
+        from tp_mcp.tools.library import _apply_structure_overrides
+        structure = {
+            "structure": [
+                _single(0, 600, _step("Warm up", 600, 45, 55, "warmUp")),
+                _repetition(600, 1800, 5, [
+                    _step("VT-2", 220, 95, 100, "active"),
+                    _step("VO2", 20, 118, 125, "active"),
+                ]),
+                _single(1800, 4800, _step("Endurance", 3000, 60, 70, "active")),
+                _single(4800, 5100, _step("Cool down", 300, 45, 55, "coolDown")),
+            ],
+        }
+        out, total = _apply_structure_overrides(structure, endurance_minutes=70)
+        blocks = out["structure"]
+        assert blocks[1]["steps"][0]["length"]["value"] == 220  # VT-2 UNCHANGED
+        assert blocks[1]["steps"][1]["length"]["value"] == 20   # VO2 UNCHANGED
+        assert blocks[1]["end"] == 600 + 5 * (220 + 20)         # block 2 = 20:00
+        assert blocks[2]["steps"][0]["length"]["value"] == 2100  # 3000 → 2100
+        assert blocks[3]["steps"][0]["length"]["value"] == 300   # cool-down fixed
+        assert total == 4200  # total 70 min
+
+
     def test_reps_not_adjustable_endurance_only(self):
         # Interval reps are fixed by the template; a plain endurance ride only
         # scales its duration.
