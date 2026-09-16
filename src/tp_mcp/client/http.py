@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -18,6 +20,34 @@ DEFAULT_TIMEOUT = 30.0
 MIN_REQUEST_INTERVAL = 0.15  # 150ms between requests to avoid rate limiting
 TOKEN_ENDPOINT = "/users/v3/token"
 TOKEN_REFRESH_BUFFER = 60  # Refresh token 60s before expiry
+
+# --- Read-through response cache -------------------------------------------
+# Set TP_MCP_CACHE_DISABLED=1 (or true/yes) to bypass GET caching entirely.
+CACHE_DISABLED = os.getenv("TP_MCP_CACHE_DISABLED", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Per-endpoint freshness windows. First matching substring wins; the list is
+# ordered most-specific first. Read-only reference data (libraries) is held far
+# longer than calendar data (workouts/events) that a coach actively edits.
+_CACHE_TTL_RULES: tuple[tuple[str, float], ...] = (
+    ("/exerciselibrary/", 3600.0),  # workout template libraries — rarely change
+    ("/settings", 1800.0),          # athlete settings/zones
+    ("/workouts/", 180.0),          # planned/completed workouts
+    ("/events", 180.0),             # events / next / focus event
+    ("/users/v3/user", 3600.0),     # coach + roster identity
+)
+_DEFAULT_CACHE_TTL = 120.0
+
+
+def _cache_ttl_for(endpoint: str) -> float:
+    """TTL (seconds) for a GET endpoint, chosen by path substring."""
+    for needle, ttl in _CACHE_TTL_RULES:
+        if needle in endpoint:
+            return ttl
+    return _DEFAULT_CACHE_TTL
 
 
 class APIError(Exception):
@@ -127,6 +157,117 @@ class TokenCache:
         self.expires_at = 0.0
 
 
+@dataclass
+class _CacheEntry:
+    """A cached GET response with its expiry."""
+
+    response: "APIResponse"
+    expires_at: float
+
+
+class _ResponseCache:
+    """Process-wide TTL cache + in-flight coalescing for idempotent GETs.
+
+    Two problems are solved together:
+
+    * TTL cache (option 1): a repeated GET within its freshness window is served
+      from memory instead of hitting TrainingPeaks again. Endpoints embed the
+      athlete id in their path (e.g. ``/athletes/1402240/workouts/...``) or are
+      coach-token scoped, so the endpoint+params key is inherently per-athlete —
+      no cross-athlete leakage.
+    * Request coalescing (option 2): concurrent identical GETs that arrive before
+      the first response lands share a single in-flight request via an
+      ``asyncio.Future`` instead of each stampeding the API.
+
+    Runs single-threaded under asyncio, so no locking is required — there is no
+    await between a cache read and the following mutation on the leader path.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, _CacheEntry] = {}
+        self._inflight: dict[str, asyncio.Future[APIResponse]] = {}
+        # Bumped on every write-invalidation. A GET that began before a write
+        # landed must NOT cache its (now stale) result, and a reader arriving
+        # after the write must NOT coalesce onto that pre-write request.
+        self._generation: int = 0
+
+    @property
+    def generation(self) -> int:
+        """Current invalidation generation (increments on each write)."""
+        return self._generation
+
+    @staticmethod
+    def make_key(endpoint: str, params: dict[str, Any] | None) -> str:
+        """Stable cache key from endpoint + sorted query params."""
+        if params:
+            items = sorted((str(k), str(v)) for k, v in params.items())
+            return endpoint + "?" + "&".join(f"{k}={v}" for k, v in items)
+        return endpoint
+
+    def get_fresh(self, key: str) -> "APIResponse | None":
+        """Return a non-expired cached response, or None on miss/expiry."""
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        if time.monotonic() >= entry.expires_at:
+            self._entries.pop(key, None)
+            return None
+        return entry.response
+
+    def inflight(self, key: str) -> "asyncio.Future[APIResponse] | None":
+        """The pending request for this key, if one is already running."""
+        return self._inflight.get(key)
+
+    def begin(self, key: str) -> "asyncio.Future[APIResponse]":
+        """Register this caller as the leader for ``key`` and return its Future."""
+        fut: asyncio.Future[APIResponse] = asyncio.get_event_loop().create_future()
+        self._inflight[key] = fut
+        return fut
+
+    def finish(self, key: str, future: asyncio.Future[APIResponse]) -> None:
+        """Drop the in-flight marker for ``key`` once the leader is done.
+
+        Only clears the entry when it is still *this* leader's future: a write
+        may have detached the key mid-flight and a newer leader may have taken
+        its place, which must not be evicted here.
+        """
+        if self._inflight.get(key) is future:
+            self._inflight.pop(key, None)
+
+    def store(self, key: str, response: "APIResponse", ttl: float) -> None:
+        """Cache a successful response for ``ttl`` seconds."""
+        self._entries[key] = _CacheEntry(
+            response=response, expires_at=time.monotonic() + ttl
+        )
+
+    def invalidate_for_write(self, endpoint: str) -> int:
+        """Drop cached GETs affected by a write to ``endpoint``.
+
+        When the write path carries an ``/athletes/<id>/`` segment, only that
+        athlete's cached GETs are dropped; otherwise (e.g. library writes) the
+        whole cache is cleared to stay safe. In-flight requests for the affected
+        keys are also detached (removed from the coalescing map) so a reader that
+        arrives after this write starts a fresh request instead of joining the
+        pre-write one. The generation counter is bumped so an in-flight leader
+        that began before this write will not cache its stale result. Returns the
+        number of cached entries removed for logging.
+        """
+        self._generation += 1
+        match = re.search(r"/athletes/(\d+)/", endpoint)
+        if match:
+            token = f"/athletes/{match.group(1)}/"
+            stale = [k for k in self._entries if token in k]
+            for k in stale:
+                self._entries.pop(k, None)
+            for k in [k for k in self._inflight if token in k]:
+                self._inflight.pop(k, None)
+            return len(stale)
+        count = len(self._entries)
+        self._entries.clear()
+        self._inflight.clear()
+        return count
+
+
 class TPClient:
     """Async HTTP client for TrainingPeaks API.
 
@@ -137,6 +278,7 @@ class TPClient:
     _cached_athlete_id: int | None = None
     _cached_user_data: dict | None = None
     _shared_token_cache: TokenCache | None = None
+    _shared_response_cache: "_ResponseCache | None" = None
 
     @classmethod
     def _get_token_cache(cls) -> TokenCache:
@@ -144,6 +286,13 @@ class TPClient:
         if cls._shared_token_cache is None:
             cls._shared_token_cache = TokenCache()
         return cls._shared_token_cache
+
+    @classmethod
+    def _get_response_cache(cls) -> "_ResponseCache":
+        """Get or create the shared GET response cache."""
+        if cls._shared_response_cache is None:
+            cls._shared_response_cache = _ResponseCache()
+        return cls._shared_response_cache
 
     def __init__(self, timeout: float = DEFAULT_TIMEOUT):
         """Initialize the client.
@@ -444,7 +593,13 @@ class TPClient:
         )
 
     async def get(self, endpoint: str, params: dict[str, Any] | None = None) -> APIResponse:
-        """Make a GET request.
+        """Make a GET request, served from the TTL cache when fresh.
+
+        Repeated identical GETs within the endpoint's freshness window are
+        returned from memory (cache HIT). Concurrent identical GETs that arrive
+        while the first is still in flight share that single request (cache
+        COALESCE) rather than each hitting TrainingPeaks. Only successful
+        responses are cached.
 
         Args:
             endpoint: API endpoint.
@@ -453,7 +608,40 @@ class TPClient:
         Returns:
             APIResponse.
         """
-        return await self._request("GET", endpoint, params=params)
+        if CACHE_DISABLED:
+            return await self._request("GET", endpoint, params=params)
+
+        cache = TPClient._get_response_cache()
+        key = cache.make_key(endpoint, params)
+
+        cached = cache.get_fresh(key)
+        if cached is not None:
+            logger.info("cache HIT      %s", key)
+            return cached
+
+        pending = cache.inflight(key)
+        if pending is not None:
+            logger.info("cache COALESCE %s", key)
+            return await pending
+
+        logger.info("cache MISS     %s", key)
+        gen_at_start = cache.generation
+        future = cache.begin(key)
+        try:
+            response = await self._request("GET", endpoint, params=params)
+            # Skip caching when a write invalidated this key mid-flight — the
+            # response we just received predates that write and is now stale.
+            if response.success and cache.generation == gen_at_start:
+                cache.store(key, response, _cache_ttl_for(endpoint))
+            if not future.done():
+                future.set_result(response)
+            return response
+        except BaseException as exc:  # propagate to any coalesced waiters
+            if not future.done():
+                future.set_exception(exc)
+            raise
+        finally:
+            cache.finish(key, future)
 
     async def post(self, endpoint: str, json: dict[str, Any] | list[Any] | None = None) -> APIResponse:
         """Make a POST request.
@@ -465,7 +653,9 @@ class TPClient:
         Returns:
             APIResponse.
         """
-        return await self._request("POST", endpoint, json=json)
+        response = await self._request("POST", endpoint, json=json)
+        self._invalidate_cache_after_write(endpoint)
+        return response
 
     async def put(self, endpoint: str, json: dict[str, Any] | list[Any] | None = None) -> APIResponse:
         """Make a PUT request.
@@ -477,7 +667,9 @@ class TPClient:
         Returns:
             APIResponse.
         """
-        return await self._request("PUT", endpoint, json=json)
+        response = await self._request("PUT", endpoint, json=json)
+        self._invalidate_cache_after_write(endpoint)
+        return response
 
     async def delete(self, endpoint: str) -> APIResponse:
         """Make a DELETE request.
@@ -488,7 +680,19 @@ class TPClient:
         Returns:
             APIResponse.
         """
-        return await self._request("DELETE", endpoint)
+        response = await self._request("DELETE", endpoint)
+        self._invalidate_cache_after_write(endpoint)
+        return response
+
+    @staticmethod
+    def _invalidate_cache_after_write(endpoint: str) -> None:
+        """Drop cached GETs that a write to ``endpoint`` may have made stale."""
+        if CACHE_DISABLED:
+            return
+        removed = TPClient._get_response_cache().invalidate_for_write(endpoint)
+        if removed:
+            logger.info("cache INVALIDATE %d entr%s after write %s",
+                        removed, "y" if removed == 1 else "ies", endpoint)
 
     async def get_raw(self, endpoint: str, params: dict[str, Any] | None = None) -> RawResponse:
         """Make an authenticated GET request and return the raw binary response.
