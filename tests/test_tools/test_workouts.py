@@ -1,12 +1,108 @@
 """Tests for workout tools."""
 
 import json
+from datetime import date, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from tp_mcp.client.http import APIResponse, ErrorCode
-from tp_mcp.tools.workouts import tp_create_workout, tp_get_workout, tp_get_workouts, tp_pair_workout, tp_unpair_workout
+from tp_mcp.tools.workouts import (
+    _canonical_workout_range,
+    tp_create_workout,
+    tp_get_workout,
+    tp_get_workouts,
+    tp_pair_workout,
+    tp_unpair_workout,
+)
+
+
+class TestCanonicalWorkoutRange:
+    """The canonical window that collapses planning-window reads onto one key."""
+
+    def test_in_window_returns_canonical(self):
+        today = date(2026, 9, 17)
+        got = _canonical_workout_range(date(2026, 9, 17), date(2026, 10, 15), today)
+        assert got == (today - timedelta(days=7), today + timedelta(days=60))
+
+    def test_request_equal_to_planning_fetch_still_collapses(self):
+        # The deterministic planning fetch (today-7 .. today+60) maps to itself.
+        today = date(2026, 9, 17)
+        got = _canonical_workout_range(
+            today - timedelta(days=7), today + timedelta(days=60), today
+        )
+        assert got == (today - timedelta(days=7), today + timedelta(days=60))
+
+    def test_end_beyond_window_bypasses(self):
+        today = date(2026, 9, 17)
+        assert _canonical_workout_range(today, today + timedelta(days=61), today) is None
+
+    def test_start_before_window_bypasses(self):
+        today = date(2026, 9, 17)
+        assert _canonical_workout_range(today - timedelta(days=8), today, today) is None
+
+    def test_reversed_range_bypasses(self):
+        today = date(2026, 9, 17)
+        assert _canonical_workout_range(today + timedelta(days=5), today, today) is None
+
+
+class TestTpGetWorkoutsCanonicalSlice:
+    """The broadened fetch must be sliced back to the caller's exact range."""
+
+    @pytest.mark.asyncio
+    async def test_broadens_fetch_and_slices_to_request(self):
+        today = date.today()
+        req_start = today
+        req_end = today + timedelta(days=10)
+        canon_start = today - timedelta(days=7)
+        canon_end = today + timedelta(days=60)
+        # Workouts spanning wider than the request: two outside [req_start,
+        # req_end] but inside the canonical window, two inside the request
+        # (including the inclusive end boundary).
+        data = [
+            {"workoutId": 1, "workoutDay": (today - timedelta(days=3)).isoformat()},
+            {"workoutId": 2, "workoutDay": today.isoformat()},
+            {"workoutId": 3, "workoutDay": (today + timedelta(days=10)).isoformat()},
+            {"workoutId": 4, "workoutDay": (today + timedelta(days=20)).isoformat()},
+        ]
+        response = APIResponse(success=True, data=data)
+
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_workouts(req_start.isoformat(), req_end.isoformat())
+
+        # The API was hit with the wide canonical window (so every planning read
+        # collapses onto one cache key), not the caller's narrow range.
+        called_endpoint = mock_instance.get.call_args.args[0]
+        assert called_endpoint.endswith(
+            f"/workouts/{canon_start.isoformat()}/{canon_end.isoformat()}"
+        )
+        # But the caller only sees workouts inside its requested [start, end].
+        dates = sorted(w["date"] for w in result["workouts"])
+        assert dates == [today.isoformat(), (today + timedelta(days=10)).isoformat()]
+        assert result["count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_out_of_window_fetches_exact_range_unchanged(self):
+        # Dates far from today never collapse — behaviour is exactly as before.
+        data = [{"workoutId": 1, "workoutDay": "2025-01-08"}]
+        response = APIResponse(success=True, data=data)
+
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_workouts("2025-01-08", "2025-01-09")
+
+        called_endpoint = mock_instance.get.call_args.args[0]
+        assert called_endpoint.endswith("/workouts/2025-01-08/2025-01-09")
+        assert result["count"] == 1
 
 
 class TestTpGetWorkouts:
