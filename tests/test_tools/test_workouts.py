@@ -877,3 +877,53 @@ class TestTpPairWorkout:
 
         assert result["isError"] is True
         assert result["error_code"] == "API_ERROR"
+
+
+class TestComplianceStatus:
+    """The three-state ``status`` field (completed / planned / missed)."""
+
+    def _summary(self, **kw):
+        from tp_mcp.client.models import WorkoutSummary
+
+        return WorkoutSummary.model_validate(kw)
+
+    def test_compliance_status_three_states(self):
+        today = date(2026, 9, 18)
+        done = self._summary(
+            workoutId=1, workoutDay="2026-09-15", totalTime=3600, tssActual=70
+        )
+        past_planned = self._summary(
+            workoutId=2, workoutDay="2026-09-15", totalTimePlanned=3600, tssPlanned=70
+        )
+        today_planned = self._summary(
+            workoutId=3, workoutDay="2026-09-18", totalTimePlanned=3600, tssPlanned=70
+        )
+        future_planned = self._summary(
+            workoutId=4, workoutDay="2026-09-20", totalTimePlanned=3600, tssPlanned=70
+        )
+        assert done.compliance_status(today) == "completed"
+        # A PAST planned workout that was never done is "missed", not "planned".
+        assert past_planned.compliance_status(today) == "missed"
+        # Today's outcome is unknown, so it stays "planned" (it still counts).
+        assert today_planned.compliance_status(today) == "planned"
+        assert future_planned.compliance_status(today) == "planned"
+
+    @pytest.mark.asyncio
+    async def test_get_workouts_emits_status(self, mock_api_responses):
+        """tp_get_workouts exposes a per-workout ``status`` field."""
+        workouts_response = APIResponse(
+            success=True, data=mock_api_responses["workouts"]
+        )
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=workouts_response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_workouts("2025-01-08", "2025-01-09")
+
+        for w in result["workouts"]:
+            assert w["status"] in {"completed", "planned", "missed"}
+        # The completed fixture workout is always "completed".
+        completed = next(w for w in result["workouts"] if w["type"] == "completed")
+        assert completed["status"] == "completed"

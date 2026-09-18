@@ -280,13 +280,18 @@ async def tp_get_workouts(
             elif workout_filter == "completed":
                 workouts = [w for w in workouts if w.is_completed]
 
-            # Convert to dict format for response
+            # Convert to dict format for response. ``status`` is the
+            # authoritative three-state lifecycle (completed / planned /
+            # missed) so consumers never have to re-derive completion from
+            # dates: a PAST planned workout that was not done is ``missed``.
+            today = date_type.today()
             workout_dicts = [
                 {
                     "id": str(w.id),
                     "date": w.date.isoformat(),
                     "title": w.title,
                     "type": w.workout_status,
+                    "status": w.compliance_status(today),
                     "sport": w.sport,
                     "duration_planned": w.duration_planned,
                     "duration_actual": w.duration_actual,

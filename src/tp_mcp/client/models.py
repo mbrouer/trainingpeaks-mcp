@@ -124,6 +124,19 @@ class WorkoutSummary(BaseModel):
         """Get workout status as string."""
         return "completed" if self.is_completed else "planned"
 
+    def compliance_status(self, today: date_type) -> str:
+        """Three-state status: ``completed`` / ``planned`` / ``missed``.
+
+        A workout counts as ``completed`` when it has been done (see
+        :pyattr:`is_completed`). Otherwise a workout dated in the PAST was
+        never done -> ``missed`` (it produced no training load); a workout
+        dated today or in the future is still ``planned``. ``today`` is passed
+        in so the caller owns the reference date and tests stay deterministic.
+        """
+        if self.is_completed:
+            return "completed"
+        return "missed" if self.workout_date < today else "planned"
+
 
 class WorkoutInterval(BaseModel):
     """Single interval in a workout structure."""
