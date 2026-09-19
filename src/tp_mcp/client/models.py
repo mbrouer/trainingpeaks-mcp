@@ -116,8 +116,22 @@ class WorkoutSummary(BaseModel):
 
     @property
     def is_completed(self) -> bool:
-        """Check if workout is completed."""
-        return bool(self.completed) or self.duration_actual is not None
+        """Whether the workout has actually been executed.
+
+        Trust ANY recorded actual data as proof of execution — not just the
+        ``completed`` flag or an actual duration. TrainingPeaks does not always
+        set ``completed`` (e.g. auto-synced device uploads, or an activity only
+        partially paired to its planned session), yet a workout carrying an
+        actual TSS or an actual distance clearly WAS done and produced load.
+        Relying on ``completed``/``totalTime`` alone wrongly reported such
+        sessions as ``missed`` (DNS), hiding real training the athlete did.
+        """
+        return (
+            bool(self.completed)
+            or self.duration_actual is not None
+            or self.tss_actual is not None
+            or self.distance_actual is not None
+        )
 
     @property
     def workout_status(self) -> str:
