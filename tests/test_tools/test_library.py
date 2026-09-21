@@ -342,6 +342,77 @@ class TestScheduleLibraryWorkout:
         assert isinstance(payload["structure"], str)
 
     @pytest.mark.asyncio
+    async def test_schedule_without_workout_id_is_error(self):
+        """A 200 with no workout id means the create did not persist — the tool
+        must report failure, not a false success."""
+        items_response = APIResponse(success=True, data=[self.TEMPLATE])
+        # TP answered OK but returned no workoutId (silently dropped create).
+        create_response = APIResponse(success=True, data={})
+        with patch("tp_mcp.tools.library.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=items_response)
+            mock_instance.post = AsyncMock(return_value=create_response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_schedule_library_workout("1", "10", "2026-04-01")
+
+        assert result.get("isError") is True
+        assert result.get("success") is not True
+        assert "not confirmed" in result["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_schedule_resolves_library_and_item_by_name(self):
+        """Passing the library NAME and item NAME (not numeric ids) resolves to
+        the right ids and schedules the workout."""
+        libraries_response = APIResponse(
+            success=True,
+            data=[{"exerciseLibraryId": 3820613, "libraryName": "Adam"}],
+        )
+        items_response = APIResponse(success=True, data=[self.TEMPLATE])
+        create_response = APIResponse(success=True, data={"workoutId": 999})
+        with patch("tp_mcp.tools.library.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            # 1st GET = libraries (name lookup), 2nd GET = that library's items.
+            mock_instance.get = AsyncMock(
+                side_effect=[libraries_response, items_response]
+            )
+            mock_instance.post = AsyncMock(return_value=create_response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_schedule_library_workout(
+                "Adam", "Sweet Spot", "2026-04-01"
+            )
+
+        assert result["success"] is True
+        assert result["workout_id"] == 999
+        # The items were fetched from the RESOLVED numeric library id.
+        items_endpoint = mock_instance.get.call_args_list[1][0][0]
+        assert items_endpoint == "/exerciselibrary/v2/libraries/3820613/items"
+
+    @pytest.mark.asyncio
+    async def test_schedule_unknown_library_name_errors(self):
+        """An unknown library name returns NOT_FOUND, not a crash."""
+        libraries_response = APIResponse(
+            success=True,
+            data=[{"exerciseLibraryId": 3820613, "libraryName": "Adam"}],
+        )
+        with patch("tp_mcp.tools.library.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=libraries_response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_schedule_library_workout(
+                "Nonexistent", "Sweet Spot", "2026-04-01"
+            )
+
+        assert result.get("isError") is True
+        assert result["error_code"] == "NOT_FOUND"
+        mock_instance.post.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_single_athlete_ignores_bulk_shape(self):
         """Omitting athletes keeps the original single-athlete result shape."""
         items_response = APIResponse(success=True, data=[self.TEMPLATE])
@@ -977,6 +1048,19 @@ class TestScheduleWithOverrides:
         # TSS scaled proportionally from 60 (0.6667h) → 45.
         result, payload, structure = await self._run(
             interval_reps_override={"0": 3}
+        )
+        assert result["success"] is True
+        assert structure["structure"][1]["length"]["value"] == 3
+        assert payload["totalTimePlanned"] == 0.5
+        assert payload["tssPlanned"] == 45.0
+
+    @pytest.mark.asyncio
+    async def test_interval_reps_override_tolerates_quoted_keys(self):
+        # Models sometimes over-escape the map keys (e.g. '"0"' instead of '0').
+        # The tool must strip the extra quotes and apply the reps just the same
+        # as a clean {"0": 3}, not reject the whole override.
+        result, payload, structure = await self._run(
+            interval_reps_override={'"0"': 3}
         )
         assert result["success"] is True
         assert structure["structure"][1]["length"]["value"] == 3

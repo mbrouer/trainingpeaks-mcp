@@ -6,6 +6,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import date
 from enum import Enum
 from typing import Any
 
@@ -35,8 +36,8 @@ CACHE_DISABLED = os.getenv("TP_MCP_CACHE_DISABLED", "").strip().lower() in (
 _CACHE_TTL_RULES: tuple[tuple[str, float], ...] = (
     ("/exerciselibrary/", 3600.0),  # workout template libraries — rarely change
     ("/settings", 1800.0),          # athlete settings/zones
-    ("/workouts/", 180.0),          # planned/completed workouts
-    ("/events", 180.0),             # events / next / focus event
+    ("/workouts/", 180.0),          # PAST workouts only (see _effective_cache_ttl)
+    ("/events", 180.0),             # PAST events only (see _effective_cache_ttl)
     ("/users/v3/user", 3600.0),     # coach + roster identity
 )
 _DEFAULT_CACHE_TTL = 120.0
@@ -48,6 +49,95 @@ def _cache_ttl_for(endpoint: str) -> float:
         if needle in endpoint:
             return ttl
     return _DEFAULT_CACHE_TTL
+
+
+# --- Past-only caching for calendar / time-series reads --------------------
+# Today's and future calendar data (workouts, events/races, ATP, availability,
+# nutrition, calendar notes, PMC metrics) is still mutable — it can be created,
+# edited, completed, or deleted at any moment — so serving it from a stale cache
+# would show a coach a workout/event that no longer exists, or hide one just
+# added. Only reads whose data is strictly in the PAST are safe to cache. The
+# reference date is taken from the URL for range reads (``.../YYYY-MM-DD/
+# YYYY-MM-DD``) and from the payload otherwise (single workout, focus/next
+# event). When it can't be determined, the read is treated as not cacheable.
+_DATED_ENDPOINT_SEGMENTS: tuple[str, ...] = (
+    "/workouts",                    # planned/completed workouts (+ single, notes)
+    "/events",                      # events/races (+ focusevent, nextplannedevent)
+    "/atp/",                        # annual training plan
+    "/availability/",               # athlete availability
+    "/nutrition/",                  # nutrition log
+    "/calendarNote/",               # calendar notes
+    "/consolidatedtimedmetrics/",   # PMC / fitness metrics
+)
+_DATE_RANGE_RE = re.compile(
+    r"/(\d{4}-\d{2}-\d{2})/(\d{4}-\d{2}-\d{2})(?:$|\?)"
+)
+# Payload fields that carry an item's calendar date, most specific first.
+_DATE_PAYLOAD_KEYS: tuple[str, ...] = (
+    "workoutDay",
+    "startTimePlanned",
+    "eventDate",
+    "date",
+    "day",
+)
+
+
+def _parse_ymd(value: Any) -> date | None:
+    """Parse the leading ``YYYY-MM-DD`` of a TP date/datetime string."""
+    if not isinstance(value, str) or len(value) < 10:
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
+def _is_dated_endpoint(endpoint: str) -> bool:
+    """True for calendar/time-series endpoints subject to the past-only rule."""
+    return any(seg in endpoint for seg in _DATED_ENDPOINT_SEGMENTS)
+
+
+def _payload_max_date(data: Any) -> date | None:
+    """Latest calendar date found in a GET payload, or None if undeterminable."""
+
+    def one(item: Any) -> date | None:
+        if not isinstance(item, dict):
+            return None
+        for key in _DATE_PAYLOAD_KEYS:
+            parsed = _parse_ymd(item.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+
+    if isinstance(data, list):
+        dates = [d for d in (one(x) for x in data) if d is not None]
+        return max(dates) if dates else None
+    return one(data)
+
+
+def _effective_cache_ttl(endpoint: str, response: "APIResponse", today: date) -> float:
+    """Freshness TTL for a GET, applying the past-only rule to dated reads.
+
+    Non-calendar endpoints (libraries, settings, user identity) keep their
+    substring TTL. Calendar/time-series reads are cached only when the whole
+    response is strictly before ``today``; anything covering today or the future
+    — including reads whose date can't be determined (e.g. the next planned
+    event) — returns 0 (never cached) so it is always read live.
+    """
+    ttl = _cache_ttl_for(endpoint)
+    if not _is_dated_endpoint(endpoint):
+        return ttl
+
+    range_match = _DATE_RANGE_RE.search(endpoint)
+    max_date = (
+        _parse_ymd(range_match.group(2))
+        if range_match
+        else _payload_max_date(response.data)
+    )
+
+    if max_date is None or max_date >= today:
+        return 0.0
+    return ttl
 
 
 class APIError(Exception):
@@ -592,6 +682,11 @@ class TPClient:
             message=f"API error: {response.status_code}",
         )
 
+    # Bound on how many times a GET re-reads after a write lands mid-flight.
+    # Prevents an unbounded loop under a sustained write storm; after this many
+    # straddled attempts the caller gets a direct, uncached (freshest) fetch.
+    _MAX_STALE_REFETCH = 3
+
     async def get(self, endpoint: str, params: dict[str, Any] | None = None) -> APIResponse:
         """Make a GET request, served from the TTL cache when fresh.
 
@@ -600,6 +695,15 @@ class TPClient:
         while the first is still in flight share that single request (cache
         COALESCE) rather than each hitting TrainingPeaks. Only successful
         responses are cached.
+
+        A write (create/update/delete) that lands while our read is in flight —
+        whether we are the leader making the request or a waiter coalesced onto
+        someone else's — makes that response predate the write and therefore
+        stale. Merely refusing to *cache* it is not enough: the value is still
+        *returned* to the caller, so the model sees a just-deleted workout or
+        misses a just-created one. We detect this via the invalidation
+        generation counter and re-read for post-write data instead of returning
+        the stale response.
 
         Args:
             endpoint: API endpoint.
@@ -614,34 +718,58 @@ class TPClient:
         cache = TPClient._get_response_cache()
         key = cache.make_key(endpoint, params)
 
-        cached = cache.get_fresh(key)
-        if cached is not None:
-            logger.info("cache HIT      %s", key)
-            return cached
+        for _attempt in range(self._MAX_STALE_REFETCH):
+            cached = cache.get_fresh(key)
+            if cached is not None:
+                logger.info("cache HIT      %s", key)
+                return cached
 
-        pending = cache.inflight(key)
-        if pending is not None:
-            logger.info("cache COALESCE %s", key)
-            return await pending
+            pending = cache.inflight(key)
+            if pending is not None:
+                gen_before = cache.generation
+                logger.info("cache COALESCE %s", key)
+                result = await pending
+                # A write landed during the coalesced wait, so the shared
+                # response predates it — re-read rather than return stale data.
+                if cache.generation != gen_before:
+                    logger.info("cache RESTALE  %s (coalesced across write)", key)
+                    continue
+                return result
 
-        logger.info("cache MISS     %s", key)
-        gen_at_start = cache.generation
-        future = cache.begin(key)
-        try:
-            response = await self._request("GET", endpoint, params=params)
-            # Skip caching when a write invalidated this key mid-flight — the
-            # response we just received predates that write and is now stale.
-            if response.success and cache.generation == gen_at_start:
-                cache.store(key, response, _cache_ttl_for(endpoint))
-            if not future.done():
-                future.set_result(response)
+            logger.info("cache MISS     %s", key)
+            gen_at_start = cache.generation
+            future = cache.begin(key)
+            try:
+                response = await self._request("GET", endpoint, params=params)
+                straddled_write = cache.generation != gen_at_start
+                # Skip caching when a write invalidated this key mid-flight — the
+                # response we just received predates that write and is now stale.
+                # Also honour the past-only workout rule: today/future workout
+                # reads get TTL 0 and are never stored.
+                ttl = _effective_cache_ttl(endpoint, response, date.today())
+                if response.success and not straddled_write and ttl > 0.0:
+                    cache.store(key, response, ttl)
+                # Resolve coalesced waiters. They re-check the generation on their
+                # side and refetch themselves when a write straddled this request.
+                if not future.done():
+                    future.set_result(response)
+            except BaseException as exc:  # propagate to any coalesced waiters
+                if not future.done():
+                    future.set_exception(exc)
+                raise
+            finally:
+                cache.finish(key, future)
+
+            # Our own network read predates a mid-flight write — refetch fresh.
+            if response.success and straddled_write:
+                logger.info("cache RESTALE  %s (leader across write)", key)
+                continue
             return response
-        except BaseException as exc:  # propagate to any coalesced waiters
-            if not future.done():
-                future.set_exception(exc)
-            raise
-        finally:
-            cache.finish(key, future)
+
+        # Exhausted refetch attempts under sustained writes: return the freshest
+        # possible read, uncached, so no stale value can linger in the cache.
+        logger.info("cache BYPASS   %s (write storm)", key)
+        return await self._request("GET", endpoint, params=params)
 
     async def post(self, endpoint: str, json: dict[str, Any] | list[Any] | None = None) -> APIResponse:
         """Make a POST request.

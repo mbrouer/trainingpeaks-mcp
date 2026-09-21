@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from datetime import date, timedelta
 from unittest.mock import AsyncMock
 
 import httpx
@@ -9,6 +10,13 @@ import pytest
 
 from tp_mcp.client import http as http_mod
 from tp_mcp.client.http import MIN_REQUEST_INTERVAL, APIResponse, TPClient
+
+
+def _past_range() -> str:
+    """A workout date range wholly in the past (so it is cacheable)."""
+    end = date.today() - timedelta(days=1)
+    start = end - timedelta(days=30)
+    return f"{start.isoformat()}/{end.isoformat()}"
 
 
 class TestThrottling:
@@ -277,13 +285,13 @@ class TestResponseCache:
             return_value=APIResponse(success=True, data={"v": 1})
         )
 
-        await client.get("/workouts/2026-09-09/2026-11-15")
+        await client.get(f"/workouts/{_past_range()}")
         # Force the stored entry to have already expired.
         cache = TPClient._get_response_cache()
         for entry in cache._entries.values():
             entry.expires_at = time.monotonic() - 1
 
-        await client.get("/workouts/2026-09-09/2026-11-15")
+        await client.get(f"/workouts/{_past_range()}")
         assert client._request.await_count == 2
 
     @pytest.mark.asyncio
@@ -330,7 +338,7 @@ class TestResponseCache:
             return_value=APIResponse(success=True, data={"v": 1})
         )
 
-        endpoint = "/fitness/v6/athletes/1402240/workouts/2026-09-09/2026-11-15"
+        endpoint = f"/fitness/v6/athletes/1402240/workouts/{_past_range()}"
         await client.get(endpoint)  # MISS → cached
         await client.get(endpoint)  # HIT
         assert client._request.await_count == 1
@@ -348,7 +356,7 @@ class TestResponseCache:
             return_value=APIResponse(success=True, data={"v": 1})
         )
 
-        other = "/fitness/v6/athletes/999/workouts/2026-09-09/2026-11-15"
+        other = f"/fitness/v6/athletes/999/workouts/{_past_range()}"
         await client.get(other)  # cache athlete 999
         await client.post("/fitness/v6/athletes/1402240/workouts", json={})
         await client.get(other)  # still a HIT — untouched
@@ -372,7 +380,7 @@ class TestResponseCache:
         """A GET in flight when a write invalidates it must not cache its stale
         result, and a reader arriving after the write must refetch."""
         client = TPClient()
-        endpoint = "/fitness/v6/athletes/1402240/workouts/2026-09-09/2026-11-15"
+        endpoint = f"/fitness/v6/athletes/1402240/workouts/{_past_range()}"
         release = asyncio.Event()
         reads = 0
 
@@ -409,5 +417,196 @@ class TestResponseCache:
         start = cache.generation
         client._invalidate_cache_after_write("/fitness/v6/athletes/1402240/workouts")
         assert cache.generation == start + 1
+
+    @pytest.mark.asyncio
+    async def test_leader_refetches_when_write_straddles_its_read(self):
+        """A write landing mid-flight makes the leader's own response stale, so
+        the leader must re-read and RETURN post-write data."""
+        client = TPClient()
+        endpoint = f"/fitness/v6/athletes/1402240/workouts/{_past_range()}"
+        release = asyncio.Event()
+        reads = 0
+
+        async def gated_read(method, ep, **kwargs):
+            nonlocal reads
+            reads += 1
+            n = reads
+            if n == 1:
+                await release.wait()  # hold the first read in flight
+            return APIResponse(success=True, data={"present": n == 1, "read": n})
+
+        client._request = gated_read
+
+        leader = asyncio.create_task(client.get(endpoint))
+        await asyncio.sleep(0.01)  # ensure the leader is in flight
+        client._invalidate_cache_after_write(
+            "/fitness/v6/athletes/1402240/workouts/999"
+        )
+        release.set()
+
+        result = await leader
+        assert result.data == {"present": False, "read": 2}
+        assert reads == 2
+
+    @pytest.mark.asyncio
+    async def test_coalesced_waiter_refetches_when_write_straddles_read(self):
+        """A waiter coalesced onto an in-flight read BEFORE a write lands must
+        not receive the leader's stale pre-write response."""
+        client = TPClient()
+        endpoint = f"/fitness/v6/athletes/1402240/workouts/{_past_range()}"
+        release = asyncio.Event()
+        reads = 0
+
+        async def gated_read(method, ep, **kwargs):
+            nonlocal reads
+            reads += 1
+            n = reads
+            if n == 1:
+                await release.wait()  # hold the leader in flight
+            return APIResponse(success=True, data={"present": n == 1, "read": n})
+
+        client._request = gated_read
+
+        leader = asyncio.create_task(client.get(endpoint))
+        await asyncio.sleep(0.01)  # leader in flight
+        waiter = asyncio.create_task(client.get(endpoint))  # COALESCES onto leader
+        await asyncio.sleep(0.01)
+        client._invalidate_cache_after_write(
+            "/fitness/v6/athletes/1402240/workouts/999"
+        )
+        release.set()
+
+        leader_res, waiter_res = await asyncio.gather(leader, waiter)
+        assert leader_res.data["present"] is False
+        assert waiter_res.data["present"] is False
+
+    @pytest.mark.asyncio
+    async def test_past_workout_range_is_cached(self):
+        """A wholly-past workout range is cacheable (second GET is a HIT)."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = f"/fitness/v6/athletes/1/workouts/{_past_range()}"
+        await client.get(endpoint)  # MISS -> cached
+        await client.get(endpoint)  # HIT
+        assert client._request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_today_workout_range_not_cached(self):
+        """A range whose end is TODAY is never cached (today is mutable)."""
+        today = date.today()
+        start = (today - timedelta(days=5)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = f"/fitness/v6/athletes/1/workouts/{start}/{today.isoformat()}"
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_future_workout_range_not_cached(self):
+        """A range extending into the future is never cached."""
+        today = date.today()
+        start = (today - timedelta(days=5)).isoformat()
+        end = (today + timedelta(days=10)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = f"/fitness/v6/athletes/1/workouts/{start}/{end}"
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_single_past_workout_is_cached(self):
+        """A single workout dated in the past is cacheable."""
+        past = (date.today() - timedelta(days=10)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(
+                success=True,
+                data={"workoutId": 1, "workoutDay": f"{past}T00:00:00"},
+            )
+        )
+        endpoint = "/fitness/v6/athletes/1/workouts/1"
+        await client.get(endpoint)  # MISS -> cached
+        await client.get(endpoint)  # HIT
+        assert client._request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_single_future_workout_not_cached(self):
+        """A single workout dated today/future is never cached."""
+        future = (date.today() + timedelta(days=1)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(
+                success=True,
+                data={"workoutId": 2, "workoutDay": f"{future}T00:00:00"},
+            )
+        )
+        endpoint = "/fitness/v6/athletes/1/workouts/2"
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_future_events_range_not_cached(self):
+        """An events range extending into the future is never cached."""
+        today = date.today()
+        start = (today - timedelta(days=30)).isoformat()
+        end = (today + timedelta(days=7)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = f"/fitness/v6/athletes/1402240/events/{start}/{end}"
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_past_events_range_is_cached(self):
+        """A wholly-past events range is cacheable."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = f"/fitness/v6/athletes/1402240/events/{_past_range()}"
+        await client.get(endpoint)  # MISS -> cached
+        await client.get(endpoint)  # HIT
+        assert client._request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_next_planned_event_not_cached(self):
+        """The next planned event is future by nature and must not be cached."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data={"eventId": 9})
+        )
+        endpoint = "/fitness/v6/athletes/1402240/events/nextplannedevent"
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_future_metrics_range_not_cached(self):
+        """PMC/metrics ranges into the future are not cached."""
+        today = date.today()
+        start = (today - timedelta(days=10)).isoformat()
+        end = (today + timedelta(days=10)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = (
+            f"/metrics/v3/athletes/1402240/consolidatedtimedmetrics/{start}/{end}"
+        )
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
 
 

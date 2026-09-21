@@ -1210,8 +1210,20 @@ TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
-                "library_id": {"type": "string"},
-                "item_id": {"type": "string"},
+                "library_id": {
+                    "type": "string",
+                    "description": (
+                        "Library numeric id OR library name (e.g. \"Adam\"); "
+                        "names are resolved automatically."
+                    ),
+                },
+                "item_id": {
+                    "type": "string",
+                    "description": (
+                        "Template numeric id OR template name (e.g. "
+                        "\"Vo2 (1/1)\"); names are resolved automatically."
+                    ),
+                },
                 "date": {"type": "string", "description": "YYYY-MM-DD"},
                 "athletes": {
                     "type": "array",

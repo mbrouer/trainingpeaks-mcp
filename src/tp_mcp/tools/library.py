@@ -9,7 +9,11 @@ from pydantic import ValidationError
 
 from tp_mcp.client import TPClient
 from tp_mcp.client.context import athlete_override
-from tp_mcp.tools._validation import WorkoutIdInput, format_validation_error
+from tp_mcp.tools._validation import (
+    WorkoutIdInput,
+    extract_created_workout_id,
+    format_validation_error,
+)
 
 logger = logging.getLogger("tp-mcp")
 
@@ -925,6 +929,76 @@ def _template_workout_payload(
     return payload
 
 
+def _matches_ref(candidate_id: Any, candidate_name: Any, ref: str) -> bool:
+    """True when ``ref`` equals a candidate's numeric id or, case-insensitively,
+    its name."""
+    if candidate_id is not None and str(candidate_id) == ref.strip():
+        return True
+    name = str(candidate_name or "").strip().lower()
+    return bool(name) and name == ref.strip().lower()
+
+
+async def _resolve_library_id(
+    client: TPClient, library_ref: str
+) -> tuple[str | None, str | None]:
+    """Resolve a library reference (numeric id or library name) to its id.
+
+    Returns ``(library_id, None)`` on success, or ``(None, error_message)`` when
+    the name is unknown or ambiguous. A purely numeric reference is trusted as-is
+    (no lookup), preserving the original id-based behaviour.
+    """
+    ref = str(library_ref).strip()
+    if ref.isdigit():
+        return ref, None
+
+    resp = await client.get("/exerciselibrary/v2/libraries")
+    libs = resp.data if isinstance(resp.data, list) else []
+    matches = [
+        str(lib.get("exerciseLibraryId", lib.get("id")))
+        for lib in libs
+        if isinstance(lib, dict)
+        and str(lib.get("libraryName", lib.get("name", "")) or "").strip().lower()
+        == ref.lower()
+    ]
+    if len(matches) == 1:
+        return matches[0], None
+    if not matches:
+        return None, f"Library {library_ref!r} not found."
+    return None, (
+        f"Ambiguous library name {library_ref!r} matches {len(matches)} "
+        "libraries; pass the numeric library id instead."
+    )
+
+
+def _resolve_library_item(
+    items: list[dict[str, Any]], item_ref: str, library_ref: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Find a template by numeric id or item name within a library's items.
+
+    Returns ``(item, None)`` on success, or ``(None, error_message)`` when the
+    reference is unknown or ambiguous.
+    """
+    ref = str(item_ref).strip()
+    matches = [
+        i
+        for i in items
+        if isinstance(i, dict)
+        and _matches_ref(
+            i.get("exerciseLibraryItemId", i.get("id")),
+            i.get("itemName", i.get("name")),
+            ref,
+        )
+    ]
+    if len(matches) == 1:
+        return matches[0], None
+    if not matches:
+        return None, f"Item {item_ref!r} not found in library {library_ref!r}."
+    return None, (
+        f"Ambiguous item name {item_ref!r} matches {len(matches)} templates in "
+        f"library {library_ref!r}; pass the numeric item id instead."
+    )
+
+
 async def tp_schedule_library_workout(
     library_id: str,
     item_id: str,
@@ -972,8 +1046,10 @@ async def tp_schedule_library_workout(
         is set only when EVERY athlete failed.
     """
     try:
-        lib_validated = WorkoutIdInput(workout_id=library_id)
-        item_validated = WorkoutIdInput(workout_id=item_id)
+        if not str(library_id).strip():
+            raise ValueError("library_id is required (a library name or numeric id).")
+        if not str(item_id).strip():
+            raise ValueError("item_id is required (a template name or numeric id).")
     except (ValidationError, ValueError) as e:
         msg = format_validation_error(e) if isinstance(e, ValidationError) else str(e)
         return {
@@ -1018,7 +1094,11 @@ async def tp_schedule_library_workout(
             return reps_err
         normalized_reps = {}
         for key, value in interval_reps_override.items():
-            key_str = str(key)
+            # Tolerate model serialization quirks: keys sometimes arrive
+            # whitespace-padded or wrapped in extra quote characters (e.g. the
+            # string '"2"' instead of '2'), which would otherwise fail the digit
+            # check below and reject the whole override.
+            key_str = str(key).strip().strip("\"'").strip()
             if not key_str.isdigit():
                 return reps_err
             if (
@@ -1068,8 +1148,18 @@ async def tp_schedule_library_workout(
                     "message": "Could not get athlete ID. Re-authenticate.",
                 }
 
+        # Resolve the library by numeric id OR name — models frequently pass the
+        # human library name (e.g. "Adam") instead of its id.
+        resolved_library_id, lib_err = await _resolve_library_id(client, library_id)
+        if lib_err is not None:
+            return {
+                "isError": True,
+                "error_code": "NOT_FOUND",
+                "message": lib_err,
+            }
+
         # Fetch the template to copy
-        items_endpoint = f"/exerciselibrary/v2/libraries/{lib_validated.workout_id}/items"
+        items_endpoint = f"/exerciselibrary/v2/libraries/{resolved_library_id}/items"
         items_response = await client.get(items_endpoint)
 
         if items_response.is_error:
@@ -1082,22 +1172,13 @@ async def tp_schedule_library_workout(
             }
 
         items = items_response.data if isinstance(items_response.data, list) else []
-        item = next(
-            (
-                i
-                for i in items
-                if i.get("exerciseLibraryItemId", i.get("id")) == item_validated.workout_id
-            ),
-            None,
-        )
+        # Resolve the template by numeric id OR item name (same reason as above).
+        item, item_err = _resolve_library_item(items, item_id, library_id)
         if item is None:
             return {
                 "isError": True,
                 "error_code": "NOT_FOUND",
-                "message": (
-                    f"Item {item_validated.workout_id} not found in "
-                    f"library {lib_validated.workout_id}."
-                ),
+                "message": item_err,
             }
 
         if athletes is not None:
@@ -1117,9 +1198,29 @@ async def tp_schedule_library_workout(
                 "message": response.message,
             }
 
-        workout_id = None
-        if isinstance(response.data, dict):
-            workout_id = response.data.get("workoutId")
+        workout_id = extract_created_workout_id(response.data)
+        if workout_id is None:
+            # TP answered without a workout id — the create did not persist.
+            # Log the raw response so the cause is visible in the server logs,
+            # and report failure (with the raw response) instead of a false
+            # success.
+            logger.warning(
+                "schedule_library_workout: create for athlete %s on %s returned "
+                "no workoutId; raw response: %r",
+                athlete_id,
+                date,
+                response.data,
+            )
+            return {
+                "isError": True,
+                "error_code": "API_ERROR",
+                "message": (
+                    "TrainingPeaks accepted the request but returned no workout "
+                    "id, so the workout was NOT confirmed created. Do not tell "
+                    "the athlete it was scheduled; retry or check the calendar. "
+                    f"Raw response: {response.data!r}"
+                ),
+            }
 
         return {
             "success": True,
@@ -1180,14 +1281,30 @@ async def _schedule_item_bulk(
                 "message": response.message,
             })
         else:
-            workout_id = None
-            if isinstance(response.data, dict):
-                workout_id = response.data.get("workoutId")
-            scheduled.append({
-                "athlete": target,
-                "athlete_id": athlete_id,
-                "workout_id": workout_id,
-            })
+            workout_id = extract_created_workout_id(response.data)
+            if workout_id is None:
+                # 200 without a workout id → the create didn't persist.
+                logger.warning(
+                    "schedule_library_workout(bulk): create for athlete %s on "
+                    "%s returned no workoutId; raw response: %r",
+                    athlete_id,
+                    date,
+                    response.data,
+                )
+                errors.append({
+                    "athlete": target,
+                    "athlete_id": athlete_id,
+                    "message": (
+                        "TrainingPeaks returned no workout id; the workout was "
+                        f"not confirmed created. Raw response: {response.data!r}"
+                    ),
+                })
+            else:
+                scheduled.append({
+                    "athlete": target,
+                    "athlete_id": athlete_id,
+                    "workout_id": workout_id,
+                })
 
     result: dict[str, Any] = {
         "date": date,

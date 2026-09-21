@@ -15,6 +15,7 @@ from tp_mcp.tools._validation import (
     DateRangeInput,
     UpdateWorkoutInput,
     WorkoutIdInput,
+    extract_created_workout_id,
     format_validation_error,
 )
 from tp_mcp.tools.structure import (
@@ -594,9 +595,30 @@ async def tp_create_workout(
                 "message": "Unexpected response format from API.",
             }
 
+        workout_id = extract_created_workout_id(response.data)
+        if workout_id is None:
+            # TP answered without a workout id — the create did not persist.
+            logger.warning(
+                "create_workout: create for athlete %s on %s returned no "
+                "workoutId; raw response: %r",
+                athlete_id,
+                date_str,
+                response.data,
+            )
+            return {
+                "isError": True,
+                "error_code": "API_ERROR",
+                "message": (
+                    "TrainingPeaks accepted the request but returned no workout "
+                    "id, so the workout was NOT confirmed created. Do not report "
+                    "it as created; retry or check the calendar. "
+                    f"Raw response: {response.data!r}"
+                ),
+            }
+
         return {
             "success": True,
-            "workout_id": response.data.get("workoutId"),
+            "workout_id": workout_id,
             "title": response.data.get("title", title),
             "date": response.data.get("startTimePlanned") or response.data.get("workoutDay", date_str),
             "sport": sport,
