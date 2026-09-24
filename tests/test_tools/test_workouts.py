@@ -159,6 +159,37 @@ class TestTpGetWorkouts:
         assert planned["tss"] == 40
 
     @pytest.mark.asyncio
+    async def test_get_workouts_keeps_zero_actual_tss(self):
+        """A completed workout with ``tssActual: 0`` keeps tss == 0 (not planned)."""
+        data = [
+            {
+                "workoutId": 2001,
+                "workoutDay": "2025-01-08",
+                "title": "Zero TSS ride",
+                "workoutTypeValueId": 2,
+                "totalTimePlanned": 1.0,
+                "totalTime": 0.5,
+                "tssPlanned": 50,
+                "tssActual": 0,
+                "completed": True,
+            }
+        ]
+        response = APIResponse(success=True, data=data)
+
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_workouts("2025-01-08", "2025-01-09")
+
+        w = result["workouts"][0]
+        assert w["tss_actual"] == 0
+        assert w["tss_planned"] == 50
+        assert w["tss"] == 0
+
+    @pytest.mark.asyncio
     async def test_get_workouts_filter_completed(self, mock_api_responses):
         """Test filtering for completed workouts only."""
         workouts_response = APIResponse(success=True, data=mock_api_responses["workouts"])
