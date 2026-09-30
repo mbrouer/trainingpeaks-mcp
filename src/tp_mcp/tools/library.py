@@ -228,67 +228,145 @@ def _scale_flex_to_budget(
         length.setdefault("unit", "second")
 
 
-def _set_total_duration(blocks: list[dict[str, Any]], target_seconds: int) -> None:
+# Standalone steps whose (percent-of-threshold) target tops out ABOVE this are
+# real work (tempo / sweet-spot / threshold blocks), not endurance filler, and
+# keep their prescribed length.
+_FILLER_MAX_PERCENT = 80
+
+# Minimum length (seconds) a MID-workout endurance filler block may shrink to
+# before the protected between-set recoveries start to give way.
+_MID_FILLER_MIN_SECONDS = 300  # 5 min
+
+# Minimum length (seconds) a protected between-set recovery may shrink to.
+_RECOVERY_MIN_SECONDS = 60  # 1 min
+
+_FIXED_BLOCK_TYPES = ("repetition", "rampUp", "rampDown")
+
+
+def _is_hard_standalone_step(step: dict[str, Any], percent_targets: bool) -> bool:
+    """A standalone step above the filler ceiling (only judged for percent-of-
+    threshold targets; recovery/warm-up/cool-down tags are never hard)."""
+    if not percent_targets:
+        return False
+    if step.get("intensityClass") in ("rest", "warmUp", "coolDown"):
+        return False
+    v = _step_intensity(step)
+    return v is not None and v > _FILLER_MAX_PERCENT
+
+
+def _is_effort_block(block: dict[str, Any], percent_targets: bool) -> bool:
+    """An interval set, a ramp, or a standalone hard step."""
+    if block.get("type") in _FIXED_BLOCK_TYPES:
+        return True
+    if _is_recovery_block(block):
+        return False
+    return any(
+        _is_hard_standalone_step(s, percent_targets) for s in block.get("steps", [])
+    )
+
+
+def _set_total_duration(
+    blocks: list[dict[str, Any]], target_seconds: int, percent_targets: bool = False
+) -> None:
     """Scale the workout so its total planned time equals ``target_seconds``.
 
-    The MAIN INTERVALS stay fixed. Concretely, EVERY step inside a ``repetition``
-    block — both the hard effort AND the short in-set recovery between reps
-    (e.g. ``5×(3:40 VT-2 + 0:20 VO₂)``) — is treated as an untouchable interval,
-    so interval timing is never stretched or squashed (a 20s VO₂ stays 20s, not
-    18s). The duration change is absorbed only by the flexible pool: standalone
-    ``rest`` recovery blocks between sets, standalone steady/endurance steps, and
-    mid-workout "easy" recovery blocks. This matches the coach's intent: a "make
-    it longer/shorter" tweak stretches the recovery/endurance, never the efforts.
+    Time is added/removed in a fixed PRIORITY ORDER decided from the workout's
+    SHAPE (block type, position, target intensity) rather than trusting the TP
+    ``intensityClass`` tags alone (templates routinely tag a between-set "Easy"
+    as ``warmUp`` and an in-set FTP float as ``rest``):
 
-    Only a LEADING ``warmUp`` block and a TRAILING ``coolDown`` block are treated
-    as fixed anchors (the true warm-up / cool-down). A low-intensity block in the
-    middle of the workout — even if TrainingPeaks tags it ``warmUp``/``coolDown``
-    — is really between-set recovery, so it flexes with the rest of the pool.
+    NEVER changed
+      - every step inside a ``repetition`` block (effort AND in-set recovery),
+      - ``rampUp``/``rampDown`` blocks (e.g. 3×1 min progressive),
+      - standalone hard steps (target > ``_FILLER_MAX_PERCENT``, e.g. tempo),
+      - a LEADING ``warmUp`` / TRAILING ``coolDown`` block.
 
-    The flexible pool is shrunk/grown by water-filling (``_scale_flex_to_budget``)
-    so the reduction spreads proportionally while honouring per-step minimums. In
-    particular the FIRST and LAST blocks keep a 10-minute floor so the opening
-    warm-up and closing cool-down are never squashed to a few seconds. Scaled
-    durations snap to clean half/whole minutes.
+    1. Endurance FILLER: standalone steady/easy steps that are not a protected
+       recovery. Absorbs the whole change on its own as long as it can stay
+       above its floors (10 min for an edge block, 5 min mid-workout, capped at
+       the original length).
+    2. Protected RECOVERIES: a standalone low-intensity block directly following
+       an effort block (e.g. the 2:30 "Easy" between 5-min VO₂ sets). Kept as
+       prescribed; flexes — together with the filler, proportionally — only
+       when the filler alone cannot absorb the cut (or there is no filler).
 
-    Falls back to scaling the work steps (``_scale_work_steps``) only when there
-    is no flexible pool at all — a workout made purely of repetition intervals
-    and/or warm-up/cool-down, where nothing else can move."""
-    flex: list[tuple[dict[str, Any], int, int]] = []  # (step, reps, floor)
-    interval_secs = 0  # every step inside repetition blocks — fixed
-    anchor_secs = 0  # leading warm-up / trailing cool-down — fixed
+    Falls back to scaling the work steps (``_scale_work_steps``) only when
+    nothing is flexible. Mirrors the TS ``setTotalDuration`` in the chat app
+    (``src/lib/workout-adjustments.ts``) so the preview matches what is written."""
+    filler: list[tuple[dict[str, Any], int, int]] = []  # (step, reps, floor)
+    recovery: list[tuple[dict[str, Any], int, int]] = []
+    fixed_secs = 0
     last_idx = len(blocks) - 1
     for idx, b in enumerate(blocks):
         reps = _block_reps(b)
-        is_repetition = b.get("type") == "repetition"
         is_edge_block = idx == 0 or idx == last_idx
+        fixed_block = b.get("type") in _FIXED_BLOCK_TYPES
+        protected_recovery = (
+            not is_edge_block
+            and _is_recovery_block(b)
+            and idx > 0
+            and _is_effort_block(blocks[idx - 1], percent_targets)
+        )
         for s in b.get("steps", []):
             dur = int((s.get("length") or {}).get("value", 0) or 0)
-            cls = s.get("intensityClass")
-            is_warm_cool = cls in ("warmUp", "coolDown")
-            if is_repetition:
-                # Main interval set — EVERY step (hard effort AND the short in-set
-                # recovery between reps, e.g. the 20s VO₂) stays fixed.
-                interval_secs += dur * reps
+            is_warm_cool = s.get("intensityClass") in ("warmUp", "coolDown")
+            if fixed_block or _is_hard_standalone_step(s, percent_targets):
+                fixed_secs += dur * reps
             elif is_warm_cool and is_edge_block:
                 # True warm-up / cool-down at the very start/end — never scaled.
-                anchor_secs += dur * reps
-            elif cls == "rest":
-                # Standalone recovery block between sets — flexible.
-                flex.append((s, reps, 1))
+                fixed_secs += dur * reps
+            elif protected_recovery:
+                recovery.append((s, reps, 1))
             else:
-                # Standalone steady/endurance/easy step — flexible. Protect the
-                # opening warm-up AND closing cool-down (the edge blocks) with a
-                # 10-minute floor (capped at the step's original length so we
-                # never invent time for an already-short block).
                 floor = min(dur, _EDGE_BLOCK_MIN_SECONDS) if is_edge_block else 1
-                flex.append((s, reps, floor))
+                filler.append((s, reps, floor))
 
-    # Preferred: keep intervals + true warm-up/cool-down fixed, absorb the delta
-    # across the flexible pool via water-filling (proportional, floor-aware).
-    if flex:
-        budget = target_seconds - interval_secs - anchor_secs
-        _scale_flex_to_budget(flex, budget)
+    def _secs(entries: list[tuple[dict[str, Any], int, int]]) -> int:
+        return sum(
+            int((s.get("length") or {}).get("value", 0) or 0) * r
+            for s, r, _ in entries
+        )
+
+    budget = target_seconds - fixed_secs
+
+    def _len(s: dict[str, Any]) -> int:
+        return int((s.get("length") or {}).get("value", 0) or 0)
+
+    # Sensible floors: edge filler 10 min, mid filler 5 min (capped at the
+    # original length); a protected recovery never below 1 min.
+    filler_f = [
+        (s, r, f if f > 1 else min(_len(s), _MID_FILLER_MIN_SECONDS))
+        for s, r, f in filler
+    ]
+    recovery_f = [
+        (s, r, min(_len(s), _RECOVERY_MIN_SECONDS)) for s, r, _ in recovery
+    ]
+
+    def _floors(entries: list[tuple[dict[str, Any], int, int]]) -> int:
+        return sum(f * r for _, r, f in entries)
+
+    # Tier 1: recoveries stay as prescribed; filler absorbs the change, provided
+    # it can stay above its sensible minimum.
+    if filler_f:
+        filler_budget = budget - _secs(recovery)
+        if filler_budget >= _floors(filler_f):
+            _scale_flex_to_budget(filler_f, filler_budget)
+            return
+
+    # Tier 2: cut too deep for the filler alone (or no filler) — flex filler AND
+    # recoveries together, proportionally, above their floors.
+    pool = filler_f + recovery_f
+    if pool:
+        if budget >= _floors(pool):
+            _scale_flex_to_budget(pool, budget)
+            return
+        # Tier 3: target UNREACHABLE (fixed work + minimum filler exceed it).
+        # Keep recoveries as prescribed, take filler to its floors and let the
+        # total overshoot rather than crushing everything to 1 s.
+        for s, _r, f in filler_f:
+            length = s.setdefault("length", {})
+            length["value"] = _round_to_half_minute(f)
+            length.setdefault("unit", "second")
         return
 
     # Fallback: nothing flexible (pure intervals and/or warm-up/cool-down) —
@@ -381,7 +459,13 @@ def _apply_structure_overrides(
     if interval_reps:
         _set_block_reps(blocks, interval_reps)
     if endurance_minutes is not None:
-        _set_total_duration(blocks, int(round(endurance_minutes * 60)))
+        metric = structure.get("primaryIntensityMetric")
+        percent_targets = isinstance(metric, str) and metric.lower().startswith(
+            "percentof"
+        )
+        _set_total_duration(
+            blocks, int(round(endurance_minutes * 60)), percent_targets
+        )
 
     total_seconds = _recompute_begin_end(blocks)
     poly = _compute_native_polyline(blocks)
@@ -864,10 +948,11 @@ def _template_workout_payload(
     Optional adjustments let a caller schedule a variant of the template
     without editing the library item itself:
 
-    * ``endurance_minutes_override`` — set the total planned duration in minutes,
-      absorbing the change in the rest periods while keeping the main interval
-      work and warm-up/cool-down fixed (falls back to scaling the work when the
-      workout has no rest to flex).
+    * ``endurance_minutes_override`` — set the total planned duration in minutes.
+      The endurance filler absorbs the change; intervals, ramps, hard blocks,
+      warm-up/cool-down and recoveries right after an interval set stay fixed
+      (recoveries flex only when the filler cannot absorb the cut — see
+      ``_set_total_duration``).
     * ``interval_reps_override`` — set new rep counts per repetition block (a map
       of block ordinal → rep count). Applied before duration scaling.
     * ``description_override`` — replace the template's description text.

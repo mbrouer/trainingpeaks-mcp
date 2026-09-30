@@ -1095,4 +1095,143 @@ class TestScheduleWithOverrides:
             mock_client.assert_not_called()
 
 
+def _vo2_five():
+    """Coach-reported "Vo2 (5 min)" template (120 min): aerobic, 3×1 min ramp,
+    easy, 3×sprint, aerobic, three 5-min blocks (2' VO₂ + 3' FTP) each followed
+    by a 2:30 "Easy" (tagged warmUp), long aerobic tail."""
+    def vo2(b, e):
+        return _repetition(b, e, 1, [
+            _step("Vo2", 120, 110, 120, "active"),
+            _step("FTP", 180, 98, 102, "rest"),
+        ])
+    return {
+        "primaryIntensityMetric": "percentOfFtp",
+        "primaryLengthMetric": "duration",
+        "structure": [
+            _single(0, 1200, _step("Aerobic endurance", 1200, 60, 70, "active")),
+            {
+                "type": "rampUp",
+                "length": {"value": 1, "unit": "repetition"},
+                "begin": 1200,
+                "end": 1380,
+                "steps": [
+                    _step("3 min progressiv", 60, 80, 90, "active"),
+                    _step("3 min progressiv", 60, 90, 100, "active"),
+                    _step("3 min progressiv", 60, 100, 110, "active"),
+                ],
+            },
+            _single(1380, 1680, _step("Easy", 300, 40, 50, "warmUp")),
+            _repetition(1680, 1878, 3, [
+                _step("Sprint", 6, 200, 400, "active"),
+                _step("Easy", 60, 50, 60, "rest"),
+            ]),
+            _single(1878, 3078, _step("Aerobic endurance", 1200, 60, 70, "active")),
+            vo2(3078, 3378),
+            _single(3378, 3528, _step("Easy", 150, 40, 50, "warmUp")),
+            vo2(3528, 3828),
+            _single(3828, 3978, _step("Easy", 150, 40, 50, "warmUp")),
+            vo2(3978, 4278),
+            _single(4278, 4428, _step("Easy", 150, 40, 50, "warmUp")),
+            _single(4428, 7200, _step("Aerobic endurance", 2772, 60, 70, "active")),
+        ],
+    }
 
+
+class TestDurationPriorityRule:
+    """Filler absorbs duration changes; recoveries after interval sets, ramps and
+    hard standalone blocks stay fixed. Mirrors the TS workout-adjustments tests."""
+
+    def test_vo2_recoveries_between_five_min_blocks_stay_fixed(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, _ = _apply_structure_overrides(_vo2_five(), endurance_minutes=90)
+        blocks = out["structure"]
+        for i in (6, 8, 10):
+            assert blocks[i]["steps"][0]["length"]["value"] == 150, i
+        assert blocks[2]["steps"][0]["length"]["value"] == 300  # easy after ramp
+
+    def test_vo2_ramp_and_intervals_untouched(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, _ = _apply_structure_overrides(_vo2_five(), endurance_minutes=90)
+        blocks = out["structure"]
+        assert [s["length"]["value"] for s in blocks[1]["steps"]] == [60, 60, 60]
+        assert blocks[3]["steps"][0]["length"]["value"] == 6
+        for i in (5, 7, 9):
+            assert blocks[i]["steps"][0]["length"]["value"] == 120
+            assert blocks[i]["steps"][1]["length"]["value"] == 180
+
+    def test_vo2_only_filler_shrinks_and_total_close_to_target(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        src = _vo2_five()
+        out, total = _apply_structure_overrides(src, endurance_minutes=90)
+        for i in (0, 4, 11):
+            v = out["structure"][i]["steps"][0]["length"]["value"]
+            assert v < src["structure"][i]["steps"][0]["length"]["value"]
+            assert v % 30 == 0
+        assert abs(total - 5400) <= 60
+
+    def test_vo2_longer_grows_only_filler(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        src = _vo2_five()
+        out, _ = _apply_structure_overrides(src, endurance_minutes=150)
+        for i in (2, 6, 8, 10):
+            assert (
+                out["structure"][i]["steps"][0]["length"]["value"]
+                == src["structure"][i]["steps"][0]["length"]["value"]
+            )
+        assert out["structure"][11]["steps"][0]["length"]["value"] > 2772
+
+    def test_standalone_sweet_spot_blocks_are_work(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        structure = {
+            "primaryIntensityMetric": "percentOfFtp",
+            "structure": [
+                _single(0, 900, _step("Warm up", 900, 50, 60, "warmUp")),
+                _single(900, 2100, _step("SST", 1200, 88, 92, "active")),
+                _single(2100, 2400, _step("Easy", 300, 40, 50, "rest")),
+                _single(2400, 3600, _step("SST", 1200, 88, 92, "active")),
+                _single(3600, 5400, _step("Endurance", 1800, 60, 70, "active")),
+                _single(5400, 6000, _step("Cool down", 600, 45, 55, "coolDown")),
+            ],
+        }
+        out, total = _apply_structure_overrides(structure, endurance_minutes=85)
+        vals = [b["steps"][0]["length"]["value"] for b in out["structure"]]
+        assert vals == [900, 1200, 300, 1200, 900, 600]
+        assert total == 5100
+
+    def test_recoveries_flex_when_no_filler(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        structure = {
+            "primaryIntensityMetric": "percentOfFtp",
+            "structure": [
+                _single(0, 600, _step("Warm up", 600, 50, 60, "warmUp")),
+                _repetition(600, 1500, 3, [_step("Work", 300, 105, 110, "active")]),
+                _single(1500, 2100, _step("Recovery", 600, 40, 50, "rest")),
+                _repetition(2100, 3000, 3, [_step("Work", 300, 105, 110, "active")]),
+                _single(3000, 3600, _step("Cool down", 600, 45, 55, "coolDown")),
+            ],
+        }
+        out, total = _apply_structure_overrides(structure, endurance_minutes=55)
+        assert out["structure"][1]["steps"][0]["length"]["value"] == 300
+        assert out["structure"][2]["steps"][0]["length"]["value"] == 300
+        assert total == 3300
+        # 51 min: rest may shrink, but never below 1 min.
+        out, _ = _apply_structure_overrides(structure, endurance_minutes=51)
+        assert out["structure"][2]["steps"][0]["length"]["value"] == 60
+        # 45 min is below the fixed work — rest kept as prescribed.
+        out, _ = _apply_structure_overrides(structure, endurance_minutes=45)
+        assert out["structure"][2]["steps"][0]["length"]["value"] == 600
+
+    def test_unreachable_target_keeps_recoveries_and_filler_floors(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(
+            _vo2_five(), interval_reps={0: 11, 1: 11, 2: 11}, endurance_minutes=90
+        )
+        s = out["structure"]
+        assert s[2]["steps"][0]["length"]["value"] == 300
+        for i in (6, 8, 10):
+            assert s[i]["steps"][0]["length"]["value"] == 150
+        assert s[0]["steps"][0]["length"]["value"] == 600
+        assert s[4]["steps"][0]["length"]["value"] == 300
+        assert s[11]["steps"][0]["length"]["value"] == 600
+        assert all(st["length"]["value"] >= 6 for b in s for st in b["steps"])
+        assert total > 5400
