@@ -1,11 +1,15 @@
 """Tests for events and calendar tools."""
 
+from datetime import date, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from tp_mcp.client.http import APIResponse, ErrorCode
 from tp_mcp.tools.events import (
+    _canonical_event_range,
+    _event_date,
+    _slice_events_to_range,
     tp_add_note_comment,
     tp_create_availability,
     tp_create_event,
@@ -21,6 +25,145 @@ from tp_mcp.tools.events import (
     tp_update_event,
     tp_update_note,
 )
+
+
+class TestCanonicalEventRange:
+    """The canonical window that collapses planning-window event reads."""
+
+    def test_in_window_returns_canonical(self):
+        today = date(2026, 9, 17)
+        got = _canonical_event_range(date(2026, 9, 17), date(2026, 10, 25), today)
+        assert got == (today - timedelta(days=7), today + timedelta(days=60))
+
+    def test_end_beyond_window_bypasses(self):
+        today = date(2026, 9, 17)
+        assert _canonical_event_range(today, today + timedelta(days=61), today) is None
+
+    def test_start_before_window_bypasses(self):
+        today = date(2026, 9, 17)
+        assert _canonical_event_range(today - timedelta(days=8), today, today) is None
+
+    def test_reversed_range_bypasses(self):
+        today = date(2026, 9, 17)
+        assert _canonical_event_range(today + timedelta(days=5), today, today) is None
+
+
+class TestEventDate:
+    """Raw event date parsing from the ``eventDate`` field."""
+
+    def test_date_only(self):
+        assert _event_date({"eventDate": "2026-09-20"}) == date(2026, 9, 20)
+
+    def test_datetime_with_t(self):
+        assert _event_date({"eventDate": "2026-09-20T10:00:00Z"}) == date(2026, 9, 20)
+
+    def test_missing_field_is_none(self):
+        assert _event_date({"name": "Race"}) is None
+
+    def test_unparseable_is_none(self):
+        assert _event_date({"eventDate": "not-a-date"}) is None
+
+    def test_non_dict_is_none(self):
+        assert _event_date("nope") is None
+
+
+class TestSliceEventsToRange:
+    """Slicing raw events to the requested range, with fail-open safety."""
+
+    def test_filters_inclusive(self):
+        start, end = date(2026, 9, 17), date(2026, 9, 27)
+        data = [
+            {"eventDate": "2026-09-10", "name": "before"},
+            {"eventDate": "2026-09-17", "name": "start-boundary"},
+            {"eventDate": "2026-09-27", "name": "end-boundary"},
+            {"eventDate": "2026-10-05", "name": "after"},
+        ]
+        got = _slice_events_to_range(data, start, end)
+        assert [e["name"] for e in got] == ["start-boundary", "end-boundary"]
+
+    def test_returns_none_when_any_event_undateable(self):
+        start, end = date(2026, 9, 17), date(2026, 9, 27)
+        data = [{"eventDate": "2026-09-20"}, {"name": "no-date"}]
+        assert _slice_events_to_range(data, start, end) is None
+
+    def test_returns_none_for_non_list(self):
+        assert _slice_events_to_range({"nope": 1}, date(2026, 9, 17), date(2026, 9, 27)) is None
+
+
+class TestGetEventsCanonicalSlice:
+    """tp_get_events broadens to the canonical window then slices back."""
+
+    @pytest.mark.asyncio
+    async def test_broadens_fetch_and_slices_to_request(self):
+        today = date.today()
+        req_start = today
+        req_end = today + timedelta(days=10)
+        canon_start = today - timedelta(days=7)
+        canon_end = today + timedelta(days=60)
+        events = [
+            {"name": "before", "eventDate": (today - timedelta(days=3)).isoformat()},
+            {"name": "in-a", "eventDate": today.isoformat()},
+            {"name": "in-b", "eventDate": (today + timedelta(days=10)).isoformat()},
+            {"name": "after", "eventDate": (today + timedelta(days=20)).isoformat()},
+        ]
+        response = APIResponse(success=True, data=events)
+
+        with patch("tp_mcp.tools.events.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_events(req_start.isoformat(), req_end.isoformat())
+
+        called_endpoint = mock_instance.get.call_args.args[0]
+        assert called_endpoint.endswith(
+            f"/events/{canon_start.isoformat()}/{canon_end.isoformat()}"
+        )
+        names = sorted(e["name"] for e in result["events"])
+        assert names == ["in-a", "in-b"]
+        assert result["count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_fail_open_refetches_exact_range_when_event_undateable(self):
+        today = date.today()
+        req_start = today
+        req_end = today + timedelta(days=10)
+        canon_start = today - timedelta(days=7)
+        canon_end = today + timedelta(days=60)
+        # One event has no parseable date → slicing must bail out and the tool
+        # must re-fetch the EXACT requested range (never drop a possible race).
+        canon_events = [
+            {"name": "dated", "eventDate": today.isoformat()},
+            {"name": "mystery"},  # no eventDate
+        ]
+        exact_events = [{"name": "dated", "eventDate": today.isoformat()}]
+
+        def _get(endpoint):
+            if endpoint.endswith(f"/events/{canon_start.isoformat()}/{canon_end.isoformat()}"):
+                return APIResponse(success=True, data=canon_events)
+            return APIResponse(success=True, data=exact_events)
+
+        with patch("tp_mcp.tools.events.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(side_effect=_get)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_events(req_start.isoformat(), req_end.isoformat())
+
+        # Both the canonical fetch AND the exact-range fallback were attempted.
+        called = [c.args[0] for c in mock_instance.get.call_args_list]
+        assert any(
+            e.endswith(f"/events/{canon_start.isoformat()}/{canon_end.isoformat()}")
+            for e in called
+        )
+        assert any(
+            e.endswith(f"/events/{req_start.isoformat()}/{req_end.isoformat()}")
+            for e in called
+        )
+        # Result reflects the exact-range fetch, unchanged from legacy behaviour.
+        assert [e["name"] for e in result["events"]] == ["dated"]
 
 
 class TestGetFocusEvent:

@@ -1,12 +1,108 @@
 """Tests for workout tools."""
 
 import json
+from datetime import date, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from tp_mcp.client.http import APIResponse, ErrorCode
-from tp_mcp.tools.workouts import tp_create_workout, tp_get_workout, tp_get_workouts, tp_pair_workout, tp_unpair_workout
+from tp_mcp.tools.workouts import (
+    _canonical_workout_range,
+    tp_create_workout,
+    tp_get_workout,
+    tp_get_workouts,
+    tp_pair_workout,
+    tp_unpair_workout,
+)
+
+
+class TestCanonicalWorkoutRange:
+    """The canonical window that collapses planning-window reads onto one key."""
+
+    def test_in_window_returns_canonical(self):
+        today = date(2026, 9, 17)
+        got = _canonical_workout_range(date(2026, 9, 17), date(2026, 10, 15), today)
+        assert got == (today - timedelta(days=7), today + timedelta(days=60))
+
+    def test_request_equal_to_planning_fetch_still_collapses(self):
+        # The deterministic planning fetch (today-7 .. today+60) maps to itself.
+        today = date(2026, 9, 17)
+        got = _canonical_workout_range(
+            today - timedelta(days=7), today + timedelta(days=60), today
+        )
+        assert got == (today - timedelta(days=7), today + timedelta(days=60))
+
+    def test_end_beyond_window_bypasses(self):
+        today = date(2026, 9, 17)
+        assert _canonical_workout_range(today, today + timedelta(days=61), today) is None
+
+    def test_start_before_window_bypasses(self):
+        today = date(2026, 9, 17)
+        assert _canonical_workout_range(today - timedelta(days=8), today, today) is None
+
+    def test_reversed_range_bypasses(self):
+        today = date(2026, 9, 17)
+        assert _canonical_workout_range(today + timedelta(days=5), today, today) is None
+
+
+class TestTpGetWorkoutsCanonicalSlice:
+    """The broadened fetch must be sliced back to the caller's exact range."""
+
+    @pytest.mark.asyncio
+    async def test_broadens_fetch_and_slices_to_request(self):
+        today = date.today()
+        req_start = today
+        req_end = today + timedelta(days=10)
+        canon_start = today - timedelta(days=7)
+        canon_end = today + timedelta(days=60)
+        # Workouts spanning wider than the request: two outside [req_start,
+        # req_end] but inside the canonical window, two inside the request
+        # (including the inclusive end boundary).
+        data = [
+            {"workoutId": 1, "workoutDay": (today - timedelta(days=3)).isoformat()},
+            {"workoutId": 2, "workoutDay": today.isoformat()},
+            {"workoutId": 3, "workoutDay": (today + timedelta(days=10)).isoformat()},
+            {"workoutId": 4, "workoutDay": (today + timedelta(days=20)).isoformat()},
+        ]
+        response = APIResponse(success=True, data=data)
+
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_workouts(req_start.isoformat(), req_end.isoformat())
+
+        # The API was hit with the wide canonical window (so every planning read
+        # collapses onto one cache key), not the caller's narrow range.
+        called_endpoint = mock_instance.get.call_args.args[0]
+        assert called_endpoint.endswith(
+            f"/workouts/{canon_start.isoformat()}/{canon_end.isoformat()}"
+        )
+        # But the caller only sees workouts inside its requested [start, end].
+        dates = sorted(w["date"] for w in result["workouts"])
+        assert dates == [today.isoformat(), (today + timedelta(days=10)).isoformat()]
+        assert result["count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_out_of_window_fetches_exact_range_unchanged(self):
+        # Dates far from today never collapse — behaviour is exactly as before.
+        data = [{"workoutId": 1, "workoutDay": "2025-01-08"}]
+        response = APIResponse(success=True, data=data)
+
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_workouts("2025-01-08", "2025-01-09")
+
+        called_endpoint = mock_instance.get.call_args.args[0]
+        assert called_endpoint.endswith("/workouts/2025-01-08/2025-01-09")
+        assert result["count"] == 1
 
 
 class TestTpGetWorkouts:
@@ -61,6 +157,37 @@ class TestTpGetWorkouts:
         assert planned["tss_planned"] == 40
         assert planned["tss_actual"] is None
         assert planned["tss"] == 40
+
+    @pytest.mark.asyncio
+    async def test_get_workouts_keeps_zero_actual_tss(self):
+        """A completed workout with ``tssActual: 0`` keeps tss == 0 (not planned)."""
+        data = [
+            {
+                "workoutId": 2001,
+                "workoutDay": "2025-01-08",
+                "title": "Zero TSS ride",
+                "workoutTypeValueId": 2,
+                "totalTimePlanned": 1.0,
+                "totalTime": 0.5,
+                "tssPlanned": 50,
+                "tssActual": 0,
+                "completed": True,
+            }
+        ]
+        response = APIResponse(success=True, data=data)
+
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_workouts("2025-01-08", "2025-01-09")
+
+        w = result["workouts"][0]
+        assert w["tss_actual"] == 0
+        assert w["tss_planned"] == 50
+        assert w["tss"] == 0
 
     @pytest.mark.asyncio
     async def test_get_workouts_filter_completed(self, mock_api_responses):
@@ -781,3 +908,53 @@ class TestTpPairWorkout:
 
         assert result["isError"] is True
         assert result["error_code"] == "API_ERROR"
+
+
+class TestComplianceStatus:
+    """The three-state ``status`` field (completed / planned / missed)."""
+
+    def _summary(self, **kw):
+        from tp_mcp.client.models import WorkoutSummary
+
+        return WorkoutSummary.model_validate(kw)
+
+    def test_compliance_status_three_states(self):
+        today = date(2026, 9, 18)
+        done = self._summary(
+            workoutId=1, workoutDay="2026-09-15", totalTime=3600, tssActual=70
+        )
+        past_planned = self._summary(
+            workoutId=2, workoutDay="2026-09-15", totalTimePlanned=3600, tssPlanned=70
+        )
+        today_planned = self._summary(
+            workoutId=3, workoutDay="2026-09-18", totalTimePlanned=3600, tssPlanned=70
+        )
+        future_planned = self._summary(
+            workoutId=4, workoutDay="2026-09-20", totalTimePlanned=3600, tssPlanned=70
+        )
+        assert done.compliance_status(today) == "completed"
+        # A PAST planned workout that was never done is "missed", not "planned".
+        assert past_planned.compliance_status(today) == "missed"
+        # Today's outcome is unknown, so it stays "planned" (it still counts).
+        assert today_planned.compliance_status(today) == "planned"
+        assert future_planned.compliance_status(today) == "planned"
+
+    @pytest.mark.asyncio
+    async def test_get_workouts_emits_status(self, mock_api_responses):
+        """tp_get_workouts exposes a per-workout ``status`` field."""
+        workouts_response = APIResponse(
+            success=True, data=mock_api_responses["workouts"]
+        )
+        with patch("tp_mcp.tools.workouts.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=workouts_response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_get_workouts("2025-01-08", "2025-01-09")
+
+        for w in result["workouts"]:
+            assert w["status"] in {"completed", "planned", "missed"}
+        # The completed fixture workout is always "completed".
+        completed = next(w for w in result["workouts"] if w["type"] == "completed")
+        assert completed["status"] == "completed"

@@ -138,6 +138,72 @@ def _with_distance_km(event: Any) -> Any:
     return event
 
 
+# Canonical read window for event-range GETs. Mirrors the workout tool: during
+# planning the deterministic calendar fetch (today-7 .. today+60) and the
+# model's own confirmation fetches ask for slightly different sub-ranges, each
+# missing the response cache on its unique URL. Collapsing every request inside
+# this shared window onto ONE canonical cache key lets them reuse a single
+# cached response. The window matches the proven-good planning fetch, so it is
+# <= the 90-day API limit and accepted by TrainingPeaks. The caller's exact
+# [start, end] is sliced back out afterwards — BUT only when every event carries
+# a parseable date; otherwise we fall back to a direct fetch of the exact range
+# so a race can never be silently dropped.
+_CANON_BACK_DAYS = 7
+_CANON_FWD_DAYS = 60
+
+
+def _canonical_event_range(
+    start: dt_date, end: dt_date, today: dt_date
+) -> tuple[dt_date, dt_date] | None:
+    """Shared wide window covering ``[start, end]`` when it lies within the
+    planning window anchored on ``today``; otherwise ``None`` (fetch as-is)."""
+    if end < start:
+        return None
+    cstart = today - timedelta(days=_CANON_BACK_DAYS)
+    cend = today + timedelta(days=_CANON_FWD_DAYS)
+    if start >= cstart and end <= cend:
+        return cstart, cend
+    return None
+
+
+def _event_date(event: Any) -> dt_date | None:
+    """Parse an event's calendar date from its raw ``eventDate`` field.
+
+    Matches how the app reads event dates (``eventDate`` split on ``T``).
+    Returns ``None`` when the field is missing or unparseable.
+    """
+    if not isinstance(event, dict):
+        return None
+    raw = event.get("eventDate")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return dt_date.fromisoformat(raw.split("T", 1)[0])
+    except ValueError:
+        return None
+
+
+def _slice_events_to_range(
+    data: Any, start: dt_date, end: dt_date
+) -> list[Any] | None:
+    """Filter raw events to the inclusive ``[start, end]`` range.
+
+    Returns ``None`` (signalling "cannot slice safely — fall back to an exact
+    fetch") if ``data`` is not a list or ANY event lacks a parseable date, so a
+    race is never dropped because of an unexpected shape.
+    """
+    if not isinstance(data, list):
+        return None
+    result: list[Any] = []
+    for event in data:
+        day = _event_date(event)
+        if day is None:
+            return None
+        if start <= day <= end:
+            result.append(event)
+    return result
+
+
 async def tp_get_focus_event() -> dict[str, Any]:
     """Get the A-priority focus event with goals and results."""
     async with TPClient() as client:
@@ -223,8 +289,28 @@ async def tp_get_events(start_date: str, end_date: str) -> dict[str, Any]:
 
         start_str = params.start_date.isoformat()
         end_str = params.end_date.isoformat()
-        endpoint = f"/fitness/v6/athletes/{athlete_id}/events/{start_str}/{end_str}"
-        response = await client.get(endpoint)
+
+        # Collapse planning-window event reads onto one shared cache key: fetch
+        # the wide canonical window and slice back to the caller's exact range.
+        # If any event can't be dated (so slicing would be unsafe), fall back to
+        # a direct fetch of the exact requested range — never drop a race.
+        canon = _canonical_event_range(params.start_date, params.end_date, dt_date.today())
+        sliced: list[Any] | None = None
+        response = None
+        if canon is not None:
+            c_start, c_end = canon[0].isoformat(), canon[1].isoformat()
+            c_endpoint = f"/fitness/v6/athletes/{athlete_id}/events/{c_start}/{c_end}"
+            c_response = await client.get(c_endpoint)
+            if not c_response.is_error:
+                sliced = _slice_events_to_range(
+                    c_response.data, params.start_date, params.end_date
+                )
+                if sliced is not None:
+                    response = c_response
+
+        if sliced is None:
+            endpoint = f"/fitness/v6/athletes/{athlete_id}/events/{start_str}/{end_str}"
+            response = await client.get(endpoint)
 
         if response.is_error:
             return {
@@ -233,7 +319,11 @@ async def tp_get_events(start_date: str, end_date: str) -> dict[str, Any]:
                 "message": response.message,
             }
 
-        data = response.data if isinstance(response.data, list) else []
+        data = (
+            sliced
+            if sliced is not None
+            else (response.data if isinstance(response.data, list) else [])
+        )
         events = [_with_distance_km(evt) for evt in data]
         return {
             "events": events,

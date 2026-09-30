@@ -1203,13 +1203,27 @@ TOOLS = [
         name="tp_schedule_library_workout",
         description=(
             "Schedule a library template to a calendar date, for yourself or "
-            "(coach accounts) for one or many athletes."
+            "(coach accounts) for one or many athletes. Optionally adjust the "
+            "scheduled copy — interval reps, total duration, or description — "
+            "without editing the template itself."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "library_id": {"type": "string"},
-                "item_id": {"type": "string"},
+                "library_id": {
+                    "type": "string",
+                    "description": (
+                        "Library numeric id OR library name (e.g. \"Adam\"); "
+                        "names are resolved automatically."
+                    ),
+                },
+                "item_id": {
+                    "type": "string",
+                    "description": (
+                        "Template numeric id OR template name (e.g. "
+                        "\"Vo2 (1/1)\"); names are resolved automatically."
+                    ),
+                },
                 "date": {"type": "string", "description": "YYYY-MM-DD"},
                 "athletes": {
                     "type": "array",
@@ -1219,6 +1233,35 @@ TOOLS = [
                         "schedule the same template to, one workout each. "
                         "Returns per-athlete results. Mutually exclusive with "
                         "'athlete'."
+                    ),
+                },
+                "description_override": {
+                    "type": "string",
+                    "description": (
+                        "Replace the template's description text on the "
+                        "scheduled workout. The template itself is unchanged."
+                    ),
+                },
+                "endurance_minutes_override": {
+                    "type": "number",
+                    "description": (
+                        "Total planned duration in minutes. The work portion is "
+                        "scaled to hit it while warm-up/cool-down stay fixed; "
+                        "planned time and TSS are recomputed to match."
+                    ),
+                },
+                "interval_reps_override": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer"},
+                    "description": (
+                        "Adjust interval/rep counts on the scheduled copy. Map "
+                        "each repetition block's index (0-based, counting only "
+                        "repetition blocks in structure order) to its new rep "
+                        "count, e.g. {\"0\": 13, \"1\": 3}. A rep count of 0 "
+                        "removes that interval set entirely. Unlisted blocks keep "
+                        "the template's reps. Combinable with "
+                        "endurance_minutes_override; planned time and TSS are "
+                        "recomputed. The template itself is unchanged."
                     ),
                 },
             },
@@ -2028,6 +2071,9 @@ async def _h_schedule_lib(args):
     return await tp_schedule_library_workout(
         library_id=args["library_id"], item_id=args["item_id"], date=args["date"],
         athletes=args.get("athletes"),
+        description_override=args.get("description_override"),
+        endurance_minutes_override=args.get("endurance_minutes_override"),
+        interval_reps_override=args.get("interval_reps_override"),
     )
 
 

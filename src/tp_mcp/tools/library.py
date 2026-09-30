@@ -1,5 +1,6 @@
 """Workout library tools: templates, scheduling."""
 
+import copy
 import json
 import logging
 from typing import Any
@@ -8,7 +9,11 @@ from pydantic import ValidationError
 
 from tp_mcp.client import TPClient
 from tp_mcp.client.context import athlete_override
-from tp_mcp.tools._validation import WorkoutIdInput, format_validation_error
+from tp_mcp.tools._validation import (
+    WorkoutIdInput,
+    extract_created_workout_id,
+    format_validation_error,
+)
 
 logger = logging.getLogger("tp-mcp")
 
@@ -87,6 +92,302 @@ def _ensure_structure_preview(structure: Any) -> Any:
         if poly:
             out["polyline"] = poly
     return out
+
+
+def _block_reps(block: dict[str, Any]) -> int:
+    """Repetition count for a block (1 for a single-step block)."""
+    if block.get("type") == "repetition":
+        return int((block.get("length") or {}).get("value", 1) or 1)
+    return 1
+
+
+def _step_seconds(block: dict[str, Any]) -> int:
+    """Total seconds of one pass through a block's steps (before reps)."""
+    total = 0
+    for s in block.get("steps", []):
+        total += int((s.get("length") or {}).get("value", 0) or 0)
+    return total
+
+
+def _recompute_begin_end(blocks: list[dict[str, Any]]) -> int:
+    """Rewrite each block's cumulative ``begin``/``end`` from its own step
+    durations and rep count. Returns the structure's total seconds."""
+    cursor = 0
+    for b in blocks:
+        duration = _step_seconds(b) * _block_reps(b)
+        b["begin"] = cursor
+        cursor += duration
+        b["end"] = cursor
+    return cursor
+
+
+def _scale_work_steps(blocks: list[dict[str, Any]], target_seconds: int) -> None:
+    """Scale the ``active``/``other`` work steps to hit ``target_seconds``,
+    treating warm-up, cool-down and rest steps as fixed anchors. When nothing is
+    marked as work (e.g. a single untyped endurance step), every step is scaled
+    uniformly instead. Used as the fallback when a workout has no rest steps to
+    flex (see ``_set_total_duration``)."""
+    def _classify() -> tuple[list[tuple[dict[str, Any], int]], int, int]:
+        work: list[tuple[dict[str, Any], int]] = []
+        work_secs = 0
+        fixed_secs = 0
+        for b in blocks:
+            reps = _block_reps(b)
+            for s in b.get("steps", []):
+                dur = int((s.get("length") or {}).get("value", 0) or 0)
+                if s.get("intensityClass") in ("warmUp", "coolDown", "rest"):
+                    fixed_secs += dur * reps
+                else:
+                    work.append((s, reps))
+                    work_secs += dur * reps
+        return work, work_secs, fixed_secs
+
+    work, work_secs, fixed_secs = _classify()
+    if not work or work_secs <= 0:
+        # No dedicated work steps — scale everything uniformly.
+        work = [(s, _block_reps(b)) for b in blocks for s in b.get("steps", [])]
+        work_secs = sum(
+            int((s.get("length") or {}).get("value", 0) or 0) * reps
+            for s, reps in work
+        )
+        fixed_secs = 0
+    if work_secs <= 0:
+        return
+    budget = max(target_seconds - fixed_secs, len(work))
+    factor = budget / work_secs
+    for step, _reps in work:
+        length = step.setdefault("length", {})
+        length["value"] = _round_to_half_minute(
+            (length.get("value", 0) or 0) * factor
+        )
+        length.setdefault("unit", "second")
+
+
+# Minimum duration (seconds) protected for the opening warm-up AND the closing
+# cool-down block (the two edge blocks).
+_EDGE_BLOCK_MIN_SECONDS = 600  # 10 min
+
+
+def _round_to_half_minute(seconds: float) -> int:
+    """Snap an adjusted duration to a clean half/whole minute so the plan never
+    shows odd times like 10:27. A minute or more rounds to the nearest 30s
+    (e.g. 627 → 630 = 10:30); sub-minute leftovers keep their whole-second value
+    so short recovery bits are not inflated up to 30s. Only the flexed/scaled
+    durations are rounded — untouched interval efforts keep their exact length."""
+    if seconds < 60:
+        return max(int(round(seconds)), 1)
+    return int(round(seconds / 30)) * 30
+
+
+def _scale_flex_to_budget(
+    flex: list[tuple[dict[str, Any], int, int]], budget: float
+) -> None:
+    """Distribute ``budget`` seconds across the flexible steps, scaling them by a
+    single factor BUT never letting any step drop below its own floor. Uses
+    water-filling: on each pass, steps whose scaled length would fall under their
+    floor are pinned at the floor and removed from the pool, and the remaining
+    budget is re-shared across the rest. This keeps the reduction proportional
+    while honouring per-step minimums (e.g. the 10-min opening warm-up / closing
+    cool-down), instead of one big pool crushing every flexible step toward 1s."""
+    entries: list[dict[str, Any]] = []
+    for step, reps, floor in flex:
+        dur = int((step.get("length") or {}).get("value", 0) or 0)
+        entries.append(
+            {
+                "step": step,
+                "reps": reps,
+                "floor": max(floor, 1),
+                "dur": dur,
+                "value": None,
+            }
+        )
+
+    remaining = budget
+    while True:
+        active = [x for x in entries if x["value"] is None]
+        scalable = sum(x["dur"] * x["reps"] for x in active)
+        if not active or scalable <= 0:
+            break
+        factor = remaining / scalable
+        # Pin every step that would fall below its floor at this factor, then
+        # retry with the leftover budget spread across the still-flexible steps.
+        pinned = [x for x in active if x["dur"] * factor < x["floor"]]
+        if not pinned:
+            for x in active:
+                x["value"] = max(int(round(x["dur"] * factor)), 1)
+            break
+        for x in pinned:
+            x["value"] = x["floor"]
+            remaining -= x["floor"] * x["reps"]
+
+    for x in entries:
+        length = x["step"].setdefault("length", {})
+        length["value"] = _round_to_half_minute(
+            x["value"] if x["value"] is not None else x["floor"]
+        )
+        length.setdefault("unit", "second")
+
+
+def _set_total_duration(blocks: list[dict[str, Any]], target_seconds: int) -> None:
+    """Scale the workout so its total planned time equals ``target_seconds``.
+
+    The MAIN INTERVALS stay fixed. Concretely, EVERY step inside a ``repetition``
+    block — both the hard effort AND the short in-set recovery between reps
+    (e.g. ``5×(3:40 VT-2 + 0:20 VO₂)``) — is treated as an untouchable interval,
+    so interval timing is never stretched or squashed (a 20s VO₂ stays 20s, not
+    18s). The duration change is absorbed only by the flexible pool: standalone
+    ``rest`` recovery blocks between sets, standalone steady/endurance steps, and
+    mid-workout "easy" recovery blocks. This matches the coach's intent: a "make
+    it longer/shorter" tweak stretches the recovery/endurance, never the efforts.
+
+    Only a LEADING ``warmUp`` block and a TRAILING ``coolDown`` block are treated
+    as fixed anchors (the true warm-up / cool-down). A low-intensity block in the
+    middle of the workout — even if TrainingPeaks tags it ``warmUp``/``coolDown``
+    — is really between-set recovery, so it flexes with the rest of the pool.
+
+    The flexible pool is shrunk/grown by water-filling (``_scale_flex_to_budget``)
+    so the reduction spreads proportionally while honouring per-step minimums. In
+    particular the FIRST and LAST blocks keep a 10-minute floor so the opening
+    warm-up and closing cool-down are never squashed to a few seconds. Scaled
+    durations snap to clean half/whole minutes.
+
+    Falls back to scaling the work steps (``_scale_work_steps``) only when there
+    is no flexible pool at all — a workout made purely of repetition intervals
+    and/or warm-up/cool-down, where nothing else can move."""
+    flex: list[tuple[dict[str, Any], int, int]] = []  # (step, reps, floor)
+    interval_secs = 0  # every step inside repetition blocks — fixed
+    anchor_secs = 0  # leading warm-up / trailing cool-down — fixed
+    last_idx = len(blocks) - 1
+    for idx, b in enumerate(blocks):
+        reps = _block_reps(b)
+        is_repetition = b.get("type") == "repetition"
+        is_edge_block = idx == 0 or idx == last_idx
+        for s in b.get("steps", []):
+            dur = int((s.get("length") or {}).get("value", 0) or 0)
+            cls = s.get("intensityClass")
+            is_warm_cool = cls in ("warmUp", "coolDown")
+            if is_repetition:
+                # Main interval set — EVERY step (hard effort AND the short in-set
+                # recovery between reps, e.g. the 20s VO₂) stays fixed.
+                interval_secs += dur * reps
+            elif is_warm_cool and is_edge_block:
+                # True warm-up / cool-down at the very start/end — never scaled.
+                anchor_secs += dur * reps
+            elif cls == "rest":
+                # Standalone recovery block between sets — flexible.
+                flex.append((s, reps, 1))
+            else:
+                # Standalone steady/endurance/easy step — flexible. Protect the
+                # opening warm-up AND closing cool-down (the edge blocks) with a
+                # 10-minute floor (capped at the step's original length so we
+                # never invent time for an already-short block).
+                floor = min(dur, _EDGE_BLOCK_MIN_SECONDS) if is_edge_block else 1
+                flex.append((s, reps, floor))
+
+    # Preferred: keep intervals + true warm-up/cool-down fixed, absorb the delta
+    # across the flexible pool via water-filling (proportional, floor-aware).
+    if flex:
+        budget = target_seconds - interval_secs - anchor_secs
+        _scale_flex_to_budget(flex, budget)
+        return
+
+    # Fallback: nothing flexible (pure intervals and/or warm-up/cool-down) —
+    # scale the work steps as a last resort so a target can still be approached.
+    _scale_work_steps(blocks, target_seconds)
+
+
+def _is_recovery_block(block: dict[str, Any]) -> bool:
+    """True when ``block`` is a standalone recovery block: a non-``repetition``
+    block whose every step is low-intensity recovery — a ``rest`` step, or a
+    ``warmUp``/``coolDown`` step (mid-workout, these are really between-set
+    "easy" recovery, matching how ``_set_total_duration`` classifies non-edge
+    warm-up/cool-down blocks). A block containing any main-effort
+    (``active``/``other``) step is NOT recovery. Used to also drop the orphaned
+    recovery that follows an interval set removed via a 0 rep count."""
+    if block.get("type") == "repetition":
+        return False
+    steps = block.get("steps") or []
+    if not steps:
+        return False
+    return all(
+        s.get("intensityClass") in ("rest", "warmUp", "coolDown") for s in steps
+    )
+
+
+def _set_block_reps(
+    blocks: list[dict[str, Any]], reps_by_ordinal: dict[int, int]
+) -> None:
+    """Rewrite the rep count (``length.value``) of each targeted repetition
+    block. ``reps_by_ordinal`` is keyed by repetition-block ordinal (0-based,
+    counting only ``type:"repetition"`` blocks in structure order). A rep count
+    of 0 REMOVES the whole interval set (that repetition block) from the
+    structure, along with the standalone recovery block immediately following it
+    (unless that recovery is the final block, i.e. a true trailing cool-down,
+    which is preserved). Non-repetition blocks and ordinals not present in the
+    map are left untouched. Mirrors the TS ``setBlockReps`` helper."""
+    ord_ = 0
+    i = 0
+    while i < len(blocks):
+        b = blocks[i]
+        if b.get("type") == "repetition":
+            v = reps_by_ordinal.get(ord_)
+            if isinstance(v, int) and not isinstance(v, bool):
+                if v <= 0:
+                    # Rep count 0 → drop the entire interval set...
+                    blocks.pop(i)
+                    # ...and the orphaned recovery block after it, as long as it
+                    # is not the final block (a trailing cool-down stays put).
+                    if i < len(blocks) - 1 and _is_recovery_block(blocks[i]):
+                        blocks.pop(i)
+                    ord_ += 1
+                    continue  # list shifted; don't advance ``i``
+                length = b.setdefault("length", {})
+                length["value"] = int(v)
+                length.setdefault("unit", "repetition")
+            ord_ += 1
+        i += 1
+
+
+def _apply_structure_overrides(
+    structure: Any,
+    *,
+    endurance_minutes: float | None = None,
+    interval_reps: dict[int, int] | None = None,
+) -> tuple[Any, int | None]:
+    """Return a COPY of a native template structure with its total duration
+    and/or per-block interval reps adjusted, plus the resulting total seconds.
+
+    ``begin``/``end`` offsets and the preview ``polyline`` are recomputed so the
+    scheduled workout renders correctly. Non-native or empty structures (and the
+    no-override case) are returned untouched with ``total_seconds=None``.
+
+    Per-block interval reps are adjustable via ``interval_reps`` (a map of
+    repetition-block ordinal → new rep count). Rep overrides are applied BEFORE
+    duration scaling so the duration budget accounts for the new rep count. The
+    template's stored structure supplies the defaults; overrides rewrite the
+    scheduled copy only."""
+    if endurance_minutes is None and not interval_reps:
+        return structure, None
+    if not isinstance(structure, dict):
+        return structure, None
+    blocks = structure.get("structure")
+    if not isinstance(blocks, list) or not blocks:
+        return structure, None
+
+    out = dict(structure)
+    blocks = copy.deepcopy(blocks)
+    out["structure"] = blocks
+
+    if interval_reps:
+        _set_block_reps(blocks, interval_reps)
+    if endurance_minutes is not None:
+        _set_total_duration(blocks, int(round(endurance_minutes * 60)))
+
+    total_seconds = _recompute_begin_end(blocks)
+    poly = _compute_native_polyline(blocks)
+    if poly:
+        out["polyline"] = poly
+    return out, total_seconds
 
 
 async def tp_get_libraries() -> dict[str, Any]:
@@ -550,31 +851,152 @@ async def tp_update_library_item(
 
 
 def _template_workout_payload(
-    item: dict[str, Any], date: str, athlete_id: int
+    item: dict[str, Any],
+    date: str,
+    athlete_id: int,
+    *,
+    description_override: str | None = None,
+    endurance_minutes_override: float | None = None,
+    interval_reps_override: dict[int, int] | None = None,
 ) -> dict[str, Any]:
-    """Build the planned-workout payload that copies a library template."""
+    """Build the planned-workout payload that copies a library template.
+
+    Optional adjustments let a caller schedule a variant of the template
+    without editing the library item itself:
+
+    * ``endurance_minutes_override`` — set the total planned duration in minutes,
+      absorbing the change in the rest periods while keeping the main interval
+      work and warm-up/cool-down fixed (falls back to scaling the work when the
+      workout has no rest to flex).
+    * ``interval_reps_override`` — set new rep counts per repetition block (a map
+      of block ordinal → rep count). Applied before duration scaling.
+    * ``description_override`` — replace the template's description text.
+
+    When a duration and/or interval-rep adjustment changes the structure,
+    ``begin``/``end``, the preview polyline, ``totalTimePlanned`` and
+    (proportionally, since IF is unchanged) ``tssPlanned`` are recomputed to
+    match.
+    """
     sport_id = item.get("workoutTypeId")
+    structure = item.get("structure")
+    total_planned = item.get("totalTimePlanned")
+    tss_planned = item.get("tssPlanned")
+
+    if structure and (
+        endurance_minutes_override is not None or interval_reps_override
+    ):
+        structure, total_seconds = _apply_structure_overrides(
+            structure,
+            endurance_minutes=endurance_minutes_override,
+            interval_reps=interval_reps_override,
+        )
+        if total_seconds:
+            new_hours = round(total_seconds / 3600, 4)
+            # Keep planned TSS consistent: at unchanged intensity, TSS scales
+            # linearly with duration.
+            if (
+                isinstance(tss_planned, (int, float))
+                and isinstance(total_planned, (int, float))
+                and total_planned > 0
+            ):
+                tss_planned = round(tss_planned * (new_hours / total_planned), 1)
+            total_planned = new_hours
+
+    description = item.get("description")
+    if description_override is not None and description_override.strip():
+        description = description_override
+
     payload: dict[str, Any] = {
         "athleteId": athlete_id,
         "workoutDay": f"{date}T00:00:00",
         "workoutTypeFamilyId": sport_id,
         "workoutTypeValueId": sport_id,
         "title": item.get("itemName"),
-        "totalTimePlanned": item.get("totalTimePlanned"),
-        "tssPlanned": item.get("tssPlanned"),
+        "totalTimePlanned": total_planned,
+        "tssPlanned": tss_planned,
         "ifPlanned": item.get("ifPlanned"),
         "distancePlanned": item.get("distancePlanned"),
         "elevationGainPlanned": item.get("elevationGainPlanned"),
         "caloriesPlanned": item.get("caloriesPlanned"),
-        "description": item.get("description"),
+        "description": description,
         "coachComments": item.get("coachComments"),
     }
     if item.get("workoutSubTypeId") is not None:
         payload["workoutSubTypeId"] = item["workoutSubTypeId"]
-    if item.get("structure"):
+    if structure:
         # Calendar workouts carry structure as a JSON string
-        payload["structure"] = json.dumps(item["structure"])
+        payload["structure"] = json.dumps(structure)
     return payload
+
+
+def _matches_ref(candidate_id: Any, candidate_name: Any, ref: str) -> bool:
+    """True when ``ref`` equals a candidate's numeric id or, case-insensitively,
+    its name."""
+    if candidate_id is not None and str(candidate_id) == ref.strip():
+        return True
+    name = str(candidate_name or "").strip().lower()
+    return bool(name) and name == ref.strip().lower()
+
+
+async def _resolve_library_id(
+    client: TPClient, library_ref: str
+) -> tuple[str | None, str | None]:
+    """Resolve a library reference (numeric id or library name) to its id.
+
+    Returns ``(library_id, None)`` on success, or ``(None, error_message)`` when
+    the name is unknown or ambiguous. A purely numeric reference is trusted as-is
+    (no lookup), preserving the original id-based behaviour.
+    """
+    ref = str(library_ref).strip()
+    if ref.isdigit():
+        return ref, None
+
+    resp = await client.get("/exerciselibrary/v2/libraries")
+    libs = resp.data if isinstance(resp.data, list) else []
+    matches = [
+        str(lib.get("exerciseLibraryId", lib.get("id")))
+        for lib in libs
+        if isinstance(lib, dict)
+        and str(lib.get("libraryName", lib.get("name", "")) or "").strip().lower()
+        == ref.lower()
+    ]
+    if len(matches) == 1:
+        return matches[0], None
+    if not matches:
+        return None, f"Library {library_ref!r} not found."
+    return None, (
+        f"Ambiguous library name {library_ref!r} matches {len(matches)} "
+        "libraries; pass the numeric library id instead."
+    )
+
+
+def _resolve_library_item(
+    items: list[dict[str, Any]], item_ref: str, library_ref: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Find a template by numeric id or item name within a library's items.
+
+    Returns ``(item, None)`` on success, or ``(None, error_message)`` when the
+    reference is unknown or ambiguous.
+    """
+    ref = str(item_ref).strip()
+    matches = [
+        i
+        for i in items
+        if isinstance(i, dict)
+        and _matches_ref(
+            i.get("exerciseLibraryItemId", i.get("id")),
+            i.get("itemName", i.get("name")),
+            ref,
+        )
+    ]
+    if len(matches) == 1:
+        return matches[0], None
+    if not matches:
+        return None, f"Item {item_ref!r} not found in library {library_ref!r}."
+    return None, (
+        f"Ambiguous item name {item_ref!r} matches {len(matches)} templates in "
+        f"library {library_ref!r}; pass the numeric item id instead."
+    )
 
 
 async def tp_schedule_library_workout(
@@ -582,6 +1004,9 @@ async def tp_schedule_library_workout(
     item_id: str,
     date: str,
     athletes: list[str] | None = None,
+    description_override: str | None = None,
+    endurance_minutes_override: float | None = None,
+    interval_reps_override: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Schedule a library template to a calendar date.
 
@@ -598,6 +1023,22 @@ async def tp_schedule_library_workout(
         athletes: Optional list of athlete names or IDs (coach accounts) to
             schedule the same template to several athletes in one call.
             Mutually exclusive with the ``athlete`` targeting parameter.
+        description_override: Optional text that replaces the template's
+            description on the scheduled workout (the template itself is left
+            unchanged).
+        endurance_minutes_override: Optional total planned duration in minutes.
+            The rest periods are stretched/shrunk to hit it while the main
+            interval work and warm-up/cool-down stay fixed (falling back to
+            scaling the work when there is no rest to flex);
+            ``totalTimePlanned``/``tssPlanned`` are recomputed to match.
+        interval_reps_override: Optional map of repetition-block ordinal
+            (0-based, counting only repetition blocks in structure order) to a
+            new rep count (0..100, where 0 removes that interval set). Only
+            listed blocks change; unlisted blocks
+            keep the template's reps. Combinable with
+            ``endurance_minutes_override`` (reps are applied first);
+            ``totalTimePlanned``/``tssPlanned`` are recomputed to match. The
+            template itself is left unchanged.
 
     Returns:
         Dict with confirmation (including new workout_id) or error. In bulk
@@ -605,8 +1046,10 @@ async def tp_schedule_library_workout(
         is set only when EVERY athlete failed.
     """
     try:
-        lib_validated = WorkoutIdInput(workout_id=library_id)
-        item_validated = WorkoutIdInput(workout_id=item_id)
+        if not str(library_id).strip():
+            raise ValueError("library_id is required (a library name or numeric id).")
+        if not str(item_id).strip():
+            raise ValueError("item_id is required (a template name or numeric id).")
     except (ValidationError, ValueError) as e:
         msg = format_validation_error(e) if isinstance(e, ValidationError) else str(e)
         return {
@@ -625,6 +1068,53 @@ async def tp_schedule_library_workout(
             "error_code": "VALIDATION_ERROR",
             "message": f"Invalid date: {date}",
         }
+
+    if endurance_minutes_override is not None and (
+        not isinstance(endurance_minutes_override, (int, float))
+        or isinstance(endurance_minutes_override, bool)
+        or endurance_minutes_override <= 0
+    ):
+        return {
+            "isError": True,
+            "error_code": "VALIDATION_ERROR",
+            "message": "endurance_minutes_override must be a positive number of minutes.",
+        }
+
+    normalized_reps: dict[int, int] | None = None
+    if interval_reps_override is not None:
+        reps_err = {
+            "isError": True,
+            "error_code": "VALIDATION_ERROR",
+            "message": (
+                "interval_reps_override must map repetition-block indices to "
+                "integer rep counts between 0 and 100 (0 removes the set)."
+            ),
+        }
+        if not isinstance(interval_reps_override, dict):
+            return reps_err
+        normalized_reps = {}
+        for key, value in interval_reps_override.items():
+            # Tolerate model serialization quirks: keys sometimes arrive
+            # whitespace-padded or wrapped in extra quote characters (e.g. the
+            # string '"2"' instead of '2'), which would otherwise fail the digit
+            # check below and reject the whole override.
+            key_str = str(key).strip().strip("\"'").strip()
+            if not key_str.isdigit():
+                return reps_err
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                or value > 100
+            ):
+                return reps_err
+            normalized_reps[int(key_str)] = int(value)
+
+    overrides: dict[str, Any] = {
+        "description_override": description_override,
+        "endurance_minutes_override": endurance_minutes_override,
+        "interval_reps_override": normalized_reps,
+    }
 
     if athletes is not None:
         if athlete_override.get() is not None:
@@ -658,8 +1148,18 @@ async def tp_schedule_library_workout(
                     "message": "Could not get athlete ID. Re-authenticate.",
                 }
 
+        # Resolve the library by numeric id OR name — models frequently pass the
+        # human library name (e.g. "Adam") instead of its id.
+        resolved_library_id, lib_err = await _resolve_library_id(client, library_id)
+        if lib_err is not None:
+            return {
+                "isError": True,
+                "error_code": "NOT_FOUND",
+                "message": lib_err,
+            }
+
         # Fetch the template to copy
-        items_endpoint = f"/exerciselibrary/v2/libraries/{lib_validated.workout_id}/items"
+        items_endpoint = f"/exerciselibrary/v2/libraries/{resolved_library_id}/items"
         items_response = await client.get(items_endpoint)
 
         if items_response.is_error:
@@ -672,31 +1172,23 @@ async def tp_schedule_library_workout(
             }
 
         items = items_response.data if isinstance(items_response.data, list) else []
-        item = next(
-            (
-                i
-                for i in items
-                if i.get("exerciseLibraryItemId", i.get("id")) == item_validated.workout_id
-            ),
-            None,
-        )
+        # Resolve the template by numeric id OR item name (same reason as above).
+        item, item_err = _resolve_library_item(items, item_id, library_id)
         if item is None:
             return {
                 "isError": True,
                 "error_code": "NOT_FOUND",
-                "message": (
-                    f"Item {item_validated.workout_id} not found in "
-                    f"library {lib_validated.workout_id}."
-                ),
+                "message": item_err,
             }
 
         if athletes is not None:
-            return await _schedule_item_bulk(client, item, date, athletes)
+            return await _schedule_item_bulk(client, item, date, athletes, overrides)
 
         assert athlete_id is not None  # resolved above in the single-athlete path
         endpoint = f"/fitness/v6/athletes/{athlete_id}/workouts"
         response = await client.post(
-            endpoint, json=_template_workout_payload(item, date, athlete_id)
+            endpoint,
+            json=_template_workout_payload(item, date, athlete_id, **overrides),
         )
 
         if response.is_error:
@@ -706,9 +1198,29 @@ async def tp_schedule_library_workout(
                 "message": response.message,
             }
 
-        workout_id = None
-        if isinstance(response.data, dict):
-            workout_id = response.data.get("workoutId")
+        workout_id = extract_created_workout_id(response.data)
+        if workout_id is None:
+            # TP answered without a workout id — the create did not persist.
+            # Log the raw response so the cause is visible in the server logs,
+            # and report failure (with the raw response) instead of a false
+            # success.
+            logger.warning(
+                "schedule_library_workout: create for athlete %s on %s returned "
+                "no workoutId; raw response: %r",
+                athlete_id,
+                date,
+                response.data,
+            )
+            return {
+                "isError": True,
+                "error_code": "API_ERROR",
+                "message": (
+                    "TrainingPeaks accepted the request but returned no workout "
+                    "id, so the workout was NOT confirmed created. Do not tell "
+                    "the athlete it was scheduled; retry or check the calendar. "
+                    f"Raw response: {response.data!r}"
+                ),
+            }
 
         return {
             "success": True,
@@ -720,15 +1232,21 @@ async def tp_schedule_library_workout(
 
 
 async def _schedule_item_bulk(
-    client: TPClient, item: dict[str, Any], date: str, athletes: list[str]
+    client: TPClient,
+    item: dict[str, Any],
+    date: str,
+    athletes: list[str],
+    overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Schedule one library template to several athletes, sequentially.
 
     Each entry is resolved exactly as the single ``athlete`` targeting
     parameter would be (name or ID, via the athlete_override context var).
     Follows the groups-tools partial-failure pattern: per-athlete ``errors``,
-    ``isError`` only when EVERY athlete failed.
+    ``isError`` only when EVERY athlete failed. Any ``overrides`` (description /
+    interval reps / duration) are applied identically to every athlete.
     """
+    overrides = overrides or {}
     scheduled: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
@@ -753,7 +1271,8 @@ async def _schedule_item_bulk(
 
         endpoint = f"/fitness/v6/athletes/{athlete_id}/workouts"
         response = await client.post(
-            endpoint, json=_template_workout_payload(item, date, athlete_id)
+            endpoint,
+            json=_template_workout_payload(item, date, athlete_id, **overrides),
         )
         if response.is_error:
             errors.append({
@@ -762,14 +1281,30 @@ async def _schedule_item_bulk(
                 "message": response.message,
             })
         else:
-            workout_id = None
-            if isinstance(response.data, dict):
-                workout_id = response.data.get("workoutId")
-            scheduled.append({
-                "athlete": target,
-                "athlete_id": athlete_id,
-                "workout_id": workout_id,
-            })
+            workout_id = extract_created_workout_id(response.data)
+            if workout_id is None:
+                # 200 without a workout id → the create didn't persist.
+                logger.warning(
+                    "schedule_library_workout(bulk): create for athlete %s on "
+                    "%s returned no workoutId; raw response: %r",
+                    athlete_id,
+                    date,
+                    response.data,
+                )
+                errors.append({
+                    "athlete": target,
+                    "athlete_id": athlete_id,
+                    "message": (
+                        "TrainingPeaks returned no workout id; the workout was "
+                        f"not confirmed created. Raw response: {response.data!r}"
+                    ),
+                })
+            else:
+                scheduled.append({
+                    "athlete": target,
+                    "athlete_id": athlete_id,
+                    "workout_id": workout_id,
+                })
 
     result: dict[str, Any] = {
         "date": date,

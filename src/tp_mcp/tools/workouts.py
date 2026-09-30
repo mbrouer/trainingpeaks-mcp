@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import date as date_type
 from datetime import datetime as datetime_type
+from datetime import timedelta
 from typing import Any, Literal, NamedTuple
 
 from pydantic import ValidationError
@@ -14,6 +15,7 @@ from tp_mcp.tools._validation import (
     DateRangeInput,
     UpdateWorkoutInput,
     WorkoutIdInput,
+    extract_created_workout_id,
     format_validation_error,
 )
 from tp_mcp.tools.structure import (
@@ -166,6 +168,35 @@ def _shift_start_time_planned(existing_start_time: str, target_day: date_type) -
     return datetime_type.combine(target_day, start_dt.timetz()).isoformat(timespec="seconds")
 
 
+# Canonical read window for workout-range GETs. During planning the deterministic
+# server-side calendar fetch (today-7 .. today+60) and the model's own
+# confirmation fetches ask for slightly different sub-ranges of the same weeks,
+# so each used to MISS the response cache on its unique URL. Collapsing every
+# request that falls inside this shared window onto ONE canonical cache key lets
+# them all reuse a single cached response. The window mirrors the proven-good
+# planning fetch exactly, so it is <= the 90-day API limit and known to be
+# accepted by TrainingPeaks. The caller's exact [start, end] is always sliced
+# back out afterwards, so the tool's output is identical to a direct range
+# fetch — no behaviour change for the model.
+_CANON_BACK_DAYS = 7
+_CANON_FWD_DAYS = 60
+
+
+def _canonical_workout_range(
+    start: date_type, end: date_type, today: date_type
+) -> tuple[date_type, date_type] | None:
+    """Shared wide window that covers ``[start, end]`` when it lies within the
+    planning window anchored on ``today``; otherwise ``None`` so the caller
+    fetches the exact requested range unchanged (current behaviour)."""
+    if end < start:
+        return None
+    cstart = today - timedelta(days=_CANON_BACK_DAYS)
+    cend = today + timedelta(days=_CANON_FWD_DAYS)
+    if start >= cstart and end <= cend:
+        return cstart, cend
+    return None
+
+
 async def tp_get_workouts(
     start_date: str,
     end_date: str,
@@ -203,7 +234,18 @@ async def tp_get_workouts(
         start_str = params.start_date.isoformat()
         end_str = params.end_date.isoformat()
 
-        endpoint = f"/fitness/v6/athletes/{athlete_id}/workouts/{start_str}/{end_str}"
+        # Collapse planning-window reads onto one shared cache key: fetch the
+        # wider canonical window (cache HIT across the deterministic planning
+        # fetch and the model's confirmation fetches) and slice back to the
+        # caller's exact range below. Out-of-window ranges fetch as-is.
+        canon = _canonical_workout_range(
+            params.start_date, params.end_date, date_type.today()
+        )
+        fetch_start, fetch_end = (
+            (canon[0].isoformat(), canon[1].isoformat()) if canon else (start_str, end_str)
+        )
+
+        endpoint = f"/fitness/v6/athletes/{athlete_id}/workouts/{fetch_start}/{fetch_end}"
         response = await client.get(endpoint)
 
         if response.is_error:
@@ -223,25 +265,42 @@ async def tp_get_workouts(
         try:
             workouts = parse_workout_list(response.data)
 
+            # When the fetch was broadened to the canonical window, slice back to
+            # exactly the requested [start, end] (inclusive) so the result is
+            # identical to a direct range fetch.
+            if canon is not None:
+                workouts = [
+                    w
+                    for w in workouts
+                    if params.start_date <= w.date <= params.end_date
+                ]
+
             # Apply filter
             if workout_filter == "planned":
                 workouts = [w for w in workouts if not w.is_completed]
             elif workout_filter == "completed":
                 workouts = [w for w in workouts if w.is_completed]
 
-            # Convert to dict format for response
+            # Convert to dict format for response. ``status`` is the
+            # authoritative three-state lifecycle (completed / planned /
+            # missed) so consumers never have to re-derive completion from
+            # dates: a PAST planned workout that was not done is ``missed``.
+            today = date_type.today()
             workout_dicts = [
                 {
                     "id": str(w.id),
                     "date": w.date.isoformat(),
                     "title": w.title,
                     "type": w.workout_status,
+                    "status": w.compliance_status(today),
                     "sport": w.sport,
                     "duration_planned": w.duration_planned,
                     "duration_actual": w.duration_actual,
                     "distance_planned_km": w.distance_planned / 1000 if w.distance_planned else None,
                     "distance_actual_km": w.distance_actual / 1000 if w.distance_actual else None,
-                    "tss": w.tss_actual or w.tss_planned,
+                    # A recorded actual of 0 is real data: never replace it
+                    # with the planned value (``or`` would).
+                    "tss": w.tss_actual if w.tss_actual is not None else w.tss_planned,
                     "tss_planned": w.tss_planned,
                     "tss_actual": w.tss_actual,
                     "description": w.description,
@@ -538,9 +597,30 @@ async def tp_create_workout(
                 "message": "Unexpected response format from API.",
             }
 
+        workout_id = extract_created_workout_id(response.data)
+        if workout_id is None:
+            # TP answered without a workout id — the create did not persist.
+            logger.warning(
+                "create_workout: create for athlete %s on %s returned no "
+                "workoutId; raw response: %r",
+                athlete_id,
+                date_str,
+                response.data,
+            )
+            return {
+                "isError": True,
+                "error_code": "API_ERROR",
+                "message": (
+                    "TrainingPeaks accepted the request but returned no workout "
+                    "id, so the workout was NOT confirmed created. Do not report "
+                    "it as created; retry or check the calendar. "
+                    f"Raw response: {response.data!r}"
+                ),
+            }
+
         return {
             "success": True,
-            "workout_id": response.data.get("workoutId"),
+            "workout_id": workout_id,
             "title": response.data.get("title", title),
             "date": response.data.get("startTimePlanned") or response.data.get("workoutDay", date_str),
             "sport": sport,

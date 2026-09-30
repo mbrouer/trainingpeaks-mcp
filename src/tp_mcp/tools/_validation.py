@@ -215,3 +215,30 @@ class PeaksInput(BaseModel):
         if self.pr_type not in valid:
             raise ValueError(f"Invalid pr_type '{self.pr_type}' for {self.sport}. Valid: {', '.join(valid)}")
         return self
+
+
+def extract_created_workout_id(data: Any) -> Any | None:
+    """Pull the new workout's id from a create/schedule POST response.
+
+    A successful TrainingPeaks create returns the planned workout as
+    ``{"workoutId": <id>}``. A few alternative/nested shapes are tolerated. When
+    NO id is present the create did not actually persist (TP can answer 200 to a
+    request it silently drops), so callers must treat ``None`` as a failure and
+    NOT report success. The id is returned unchanged (its original type) so
+    existing callers/consumers see the same value they did before.
+    """
+    def _from(d: Any) -> Any:
+        if not isinstance(d, dict):
+            return None
+        for key in ("workoutId", "workout_id", "Id", "id"):
+            value = d.get(key)
+            if value is not None:
+                return value
+        return None
+
+    wid = _from(data)
+    if wid is None and isinstance(data, dict):
+        wid = _from(data.get("workout"))
+    if wid is None and isinstance(data, list) and data:
+        wid = _from(data[0])
+    return wid

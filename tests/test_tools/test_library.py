@@ -342,6 +342,77 @@ class TestScheduleLibraryWorkout:
         assert isinstance(payload["structure"], str)
 
     @pytest.mark.asyncio
+    async def test_schedule_without_workout_id_is_error(self):
+        """A 200 with no workout id means the create did not persist — the tool
+        must report failure, not a false success."""
+        items_response = APIResponse(success=True, data=[self.TEMPLATE])
+        # TP answered OK but returned no workoutId (silently dropped create).
+        create_response = APIResponse(success=True, data={})
+        with patch("tp_mcp.tools.library.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=items_response)
+            mock_instance.post = AsyncMock(return_value=create_response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_schedule_library_workout("1", "10", "2026-04-01")
+
+        assert result.get("isError") is True
+        assert result.get("success") is not True
+        assert "not confirmed" in result["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_schedule_resolves_library_and_item_by_name(self):
+        """Passing the library NAME and item NAME (not numeric ids) resolves to
+        the right ids and schedules the workout."""
+        libraries_response = APIResponse(
+            success=True,
+            data=[{"exerciseLibraryId": 3820613, "libraryName": "Adam"}],
+        )
+        items_response = APIResponse(success=True, data=[self.TEMPLATE])
+        create_response = APIResponse(success=True, data={"workoutId": 999})
+        with patch("tp_mcp.tools.library.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            # 1st GET = libraries (name lookup), 2nd GET = that library's items.
+            mock_instance.get = AsyncMock(
+                side_effect=[libraries_response, items_response]
+            )
+            mock_instance.post = AsyncMock(return_value=create_response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_schedule_library_workout(
+                "Adam", "Sweet Spot", "2026-04-01"
+            )
+
+        assert result["success"] is True
+        assert result["workout_id"] == 999
+        # The items were fetched from the RESOLVED numeric library id.
+        items_endpoint = mock_instance.get.call_args_list[1][0][0]
+        assert items_endpoint == "/exerciselibrary/v2/libraries/3820613/items"
+
+    @pytest.mark.asyncio
+    async def test_schedule_unknown_library_name_errors(self):
+        """An unknown library name returns NOT_FOUND, not a crash."""
+        libraries_response = APIResponse(
+            success=True,
+            data=[{"exerciseLibraryId": 3820613, "libraryName": "Adam"}],
+        )
+        with patch("tp_mcp.tools.library.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=libraries_response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_schedule_library_workout(
+                "Nonexistent", "Sweet Spot", "2026-04-01"
+            )
+
+        assert result.get("isError") is True
+        assert result["error_code"] == "NOT_FOUND"
+        mock_instance.post.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_single_athlete_ignores_bulk_shape(self):
         """Omitting athletes keeps the original single-athlete result shape."""
         items_response = APIResponse(success=True, data=[self.TEMPLATE])
@@ -533,3 +604,495 @@ class TestScheduleLibraryWorkoutBulk:
         assert result["isError"] is True
         assert result["error_code"] == "VALIDATION_ERROR"
         mock_client.assert_not_called()
+
+
+def _step(name, seconds, lo, hi, cls):
+    return {
+        "name": name,
+        "type": "step",
+        "length": {"value": seconds, "unit": "second"},
+        "targets": [{"minValue": lo, "maxValue": hi}],
+        "intensityClass": cls,
+    }
+
+
+def _single(begin, end, step):
+    return {
+        "type": "step",
+        "length": {"value": 1, "unit": "repetition"},
+        "begin": begin,
+        "end": end,
+        "steps": [step],
+    }
+
+
+def _repetition(begin, end, reps, steps):
+    return {
+        "type": "repetition",
+        "length": {"value": reps, "unit": "repetition"},
+        "begin": begin,
+        "end": end,
+        "steps": steps,
+    }
+
+
+class TestApplyStructureOverrides:
+    """Unit tests for the structure-adjustment helper."""
+
+    # 10min warm-up, 5×(3min work + 2min rest), 5min cool-down = 2400s.
+    INTERVAL_STRUCTURE = {
+        "primaryIntensityMetric": "percentOfFtp",
+        "primaryLengthMetric": "duration",
+        "structure": [
+            _single(0, 600, _step("Warm up", 600, 45, 55, "warmUp")),
+            _repetition(600, 2100, 5, [
+                _step("Work", 180, 88, 93, "active"),
+                _step("Rest", 120, 40, 50, "rest"),
+            ]),
+            _single(2100, 2400, _step("Cool down", 300, 45, 55, "coolDown")),
+        ],
+    }
+
+    # 10min warm-up, 5×(3min work + 2min in-set rest), 20min endurance filler,
+    # 5min cool-down = 3600s.
+    INTERVAL_WITH_FILLER = {
+        "primaryIntensityMetric": "percentOfFtp",
+        "primaryLengthMetric": "duration",
+        "structure": [
+            _single(0, 600, _step("Warm up", 600, 45, 55, "warmUp")),
+            _repetition(600, 2100, 5, [
+                _step("Work", 180, 88, 93, "active"),
+                _step("Rest", 120, 40, 50, "rest"),
+            ]),
+            _single(2100, 3300, _step("Endurance", 1200, 60, 70, "active")),
+            _single(3300, 3600, _step("Cool down", 300, 45, 55, "coolDown")),
+        ],
+    }
+
+    def test_no_override_returns_untouched(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(self.INTERVAL_STRUCTURE)
+        assert out is self.INTERVAL_STRUCTURE
+        assert total is None
+
+    def test_endurance_minutes_override_scales_work_keeps_anchors(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        structure = {
+            "primaryIntensityMetric": "percentOfFtp",
+            "primaryLengthMetric": "duration",
+            "structure": [
+                _single(0, 300, _step("Warm up", 300, 45, 55, "warmUp")),
+                _single(300, 3300, _step("Endurance", 3000, 65, 75, "active")),
+                _single(3300, 3600, _step("Cool down", 300, 45, 55, "coolDown")),
+            ],
+        }
+        out, total = _apply_structure_overrides(structure, endurance_minutes=90)
+        blocks = out["structure"]
+        # Warm-up + cool-down fixed (600s); work scaled 3000 → 4800 to hit 5400s.
+        assert blocks[0]["steps"][0]["length"]["value"] == 300
+        assert blocks[1]["steps"][0]["length"]["value"] == 4800
+        assert blocks[2]["steps"][0]["length"]["value"] == 300
+        assert total == 5400
+
+    def test_endurance_override_uniform_when_no_work_step(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        structure = {
+            "structure": [
+                _single(0, 3600, _step("Ride", 3600, 65, 75, "warmUp")),
+            ],
+        }
+        out, total = _apply_structure_overrides(structure, endurance_minutes=30)
+        assert out["structure"][0]["steps"][0]["length"]["value"] == 1800
+        assert total == 1800
+
+    def test_longer_duration_keeps_work_fixed_stretches_rest(self):
+        # 60min → 70min: the interval set (work 180s AND in-set rest 120s) and
+        # the warm-up/cool-down stay fixed; the standalone endurance filler grows
+        # to absorb the extra 10 minutes.
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(
+            self.INTERVAL_WITH_FILLER, endurance_minutes=70
+        )
+        blocks = out["structure"]
+        assert blocks[0]["steps"][0]["length"]["value"] == 600  # warm-up fixed
+        assert blocks[1]["steps"][0]["length"]["value"] == 180  # work UNCHANGED
+        assert blocks[1]["steps"][1]["length"]["value"] == 120  # in-set rest UNCHANGED
+        assert blocks[2]["steps"][0]["length"]["value"] == 1800  # filler 1200 → 1800
+        assert blocks[3]["steps"][0]["length"]["value"] == 300  # cool-down fixed
+        assert total == 4200
+
+    def test_shorter_duration_keeps_work_fixed_shrinks_rest(self):
+        # 60min → 50min: interval work + in-set rest stay fixed; the endurance
+        # filler shrinks from 1200s to 600s.
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(
+            self.INTERVAL_WITH_FILLER, endurance_minutes=50
+        )
+        blocks = out["structure"]
+        assert blocks[1]["steps"][0]["length"]["value"] == 180  # work UNCHANGED
+        assert blocks[1]["steps"][1]["length"]["value"] == 120  # in-set rest UNCHANGED
+        assert blocks[2]["steps"][0]["length"]["value"] == 600  # filler 1200 → 600
+        assert total == 3000
+
+    def test_very_short_target_keeps_intervals_fixed_collapses_rest(self):
+        # Target shorter than intervals + warm-up/cool-down: the interval efforts
+        # and their in-set rest stay put and the filler collapses toward its
+        # minimum, never compressing the efforts.
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, _ = _apply_structure_overrides(
+            self.INTERVAL_WITH_FILLER, endurance_minutes=30
+        )
+        blocks = out["structure"]
+        assert blocks[1]["steps"][0]["length"]["value"] == 180  # work UNCHANGED
+        assert blocks[1]["steps"][1]["length"]["value"] == 120  # in-set rest UNCHANGED
+        assert blocks[2]["steps"][0]["length"]["value"] < 1200  # filler collapsed
+
+    def test_repetition_intervals_fixed_endurance_filler_absorbs_change(self):
+        # Mirrors the reported case: 5×(3:40 VT-2 + 0:20 VO₂) with NO rest inside
+        # the block. A separate endurance step flexes; the efforts stay fixed.
+        from tp_mcp.tools.library import _apply_structure_overrides
+        structure = {
+            "structure": [
+                _single(0, 600, _step("Warm up", 600, 45, 55, "warmUp")),
+                _repetition(600, 1800, 5, [
+                    _step("VT-2", 220, 95, 100, "active"),
+                    _step("VO2", 20, 118, 125, "active"),
+                ]),
+                _single(1800, 4800, _step("Endurance", 3000, 60, 70, "active")),
+                _single(4800, 5100, _step("Cool down", 300, 45, 55, "coolDown")),
+            ],
+        }
+        out, total = _apply_structure_overrides(structure, endurance_minutes=70)
+        blocks = out["structure"]
+        assert blocks[1]["steps"][0]["length"]["value"] == 220  # VT-2 UNCHANGED
+        assert blocks[1]["steps"][1]["length"]["value"] == 20   # VO2 UNCHANGED
+        assert blocks[1]["end"] == 600 + 5 * (220 + 20)         # block 2 = 20:00
+        assert blocks[2]["steps"][0]["length"]["value"] == 2100  # 3000 → 2100
+        assert blocks[3]["steps"][0]["length"]["value"] == 300   # cool-down fixed
+        assert total == 4200  # total 70 min
+
+    def test_in_set_recovery_and_edge_floors_reported_case(self):
+        # Exact reported bug: VO₂ (a `rest` step INSIDE the VT-2 repetition set)
+        # and the sprint's in-set easy recovery must NOT be reduced, while the
+        # standalone aerobic/easy blocks absorb the change and the opening
+        # warm-up / closing cool-down keep a 10-minute floor.
+        from tp_mcp.tools.library import _apply_structure_overrides
+        structure = {
+            "structure": [
+                _single(0, 1800, _step("Aerobic", 1800, 60, 70, "active")),
+                _repetition(1800, 3000, 5, [
+                    _step("VT-2", 220, 90, 92, "active"),
+                    _step("Vo2", 20, 110, 120, "rest"),
+                ]),
+                _single(3000, 4200, _step("Easy", 1200, 40, 50, "warmUp")),
+                _repetition(4200, 5400, 5, [
+                    _step("VT-2", 220, 90, 92, "active"),
+                    _step("Vo2", 20, 110, 120, "rest"),
+                ]),
+                _single(5400, 6600, _step("Easy", 1200, 40, 50, "warmUp")),
+                _single(6600, 10425, _step("Aerobic", 3825, 60, 70, "active")),
+                _repetition(10425, 11375, 5, [
+                    _step("Sprint", 10, 200, 400, "active"),
+                    _step("Easy", 180, 50, 60, "rest"),
+                ]),
+                _single(11375, 12000, _step("Aerobic tail", 625, 60, 70, "active")),
+            ],
+        }
+        out, _ = _apply_structure_overrides(structure, endurance_minutes=180)
+        blocks = out["structure"]
+        # In-set recovery steps stay fixed (the reported 20s → 18s regression).
+        assert blocks[1]["steps"][1]["length"]["value"] == 20   # VO₂ UNCHANGED
+        assert blocks[6]["steps"][1]["length"]["value"] == 180  # sprint recovery UNCHANGED
+        # Interval efforts untouched.
+        assert blocks[1]["steps"][0]["length"]["value"] == 220
+        assert blocks[6]["steps"][0]["length"]["value"] == 10
+        # Opening warm-up and closing cool-down keep their 10-minute floor.
+        assert blocks[0]["steps"][0]["length"]["value"] >= 600
+        assert blocks[7]["steps"][0]["length"]["value"] >= 600
+
+    def test_reps_not_adjustable_endurance_only(self):
+        # Interval reps are fixed by the template; a plain endurance ride only
+        # scales its duration.
+        from tp_mcp.tools.library import _apply_structure_overrides
+        structure = {
+            "structure": [
+                _single(0, 3600, _step("Ride", 3600, 65, 75, "active")),
+            ],
+        }
+        out, total = _apply_structure_overrides(structure, endurance_minutes=30)
+        assert out["structure"][0]["length"]["value"] == 1  # unchanged
+        assert total == 1800
+
+    def test_non_native_structure_ignored(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        assert _apply_structure_overrides(None, endurance_minutes=90) == (None, None)
+        assert _apply_structure_overrides({"steps": []}, endurance_minutes=90) == (
+            {"steps": []}, None,
+        )
+
+    def test_interval_reps_override_rewrites_block(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, interval_reps={0: 3}
+        )
+        blocks = out["structure"]
+        assert blocks[1]["length"]["value"] == 3  # reps 5 → 3
+        # total = warm-up 600 + 3×(180+120) + cool-down 300 = 1800
+        assert total == 600 + 3 * (180 + 120) + 300
+        # Source untouched (deep copy)
+        assert self.INTERVAL_STRUCTURE["structure"][1]["length"]["value"] == 5
+
+    def test_interval_reps_zero_removes_set(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, interval_reps={0: 0}
+        )
+        blocks = out["structure"]
+        # The repetition block is dropped, leaving warm-up + cool-down only.
+        assert len(blocks) == 2
+        assert all(b.get("type") != "repetition" for b in blocks)
+        # total = warm-up 600 + cool-down 300 = 900
+        assert total == 900
+        # Source untouched (deep copy)
+        assert len(self.INTERVAL_STRUCTURE["structure"]) == 3
+
+    def test_interval_reps_zero_removes_trailing_rest_block(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        structure = {
+            "structure": [
+                _single(0, 600, _step("Warm up", 600, 45, 55, "warmUp")),
+                _repetition(600, 2100, 5, [
+                    _step("Work", 180, 88, 93, "active"),
+                    _step("Rest", 120, 40, 50, "rest"),
+                ]),
+                _single(2100, 2400, _step("Recovery", 300, 40, 50, "rest")),
+                _repetition(2400, 3900, 5, [
+                    _step("Work", 180, 88, 93, "active"),
+                    _step("Rest", 120, 40, 50, "rest"),
+                ]),
+                _single(3900, 4200, _step("Cool down", 300, 45, 55, "coolDown")),
+            ],
+        }
+        out, _ = _apply_structure_overrides(structure, interval_reps={0: 0})
+        blocks = out["structure"]
+        # First interval set AND the recovery block right after it are removed.
+        assert [b["steps"][0]["name"] for b in blocks] == [
+            "Warm up",
+            "Work",
+            "Cool down",
+        ]
+        assert blocks[1]["type"] == "repetition"  # second set survives
+
+    def test_interval_reps_zero_removes_easy_warmup_recovery(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        # Real-world shape: sets separated by an "Easy" recovery that TP tags
+        # warmUp. Dropping the middle set must also drop its trailing recovery.
+        structure = {
+            "structure": [
+                _single(0, 1800, _step("Aerobic", 1800, 60, 70, "active")),
+                _repetition(1800, 3000, 5, [
+                    _step("VT-2", 220, 90, 92, "active"),
+                    _step("Vo2", 20, 110, 120, "rest"),
+                ]),
+                _single(3000, 4200, _step("Easy", 1200, 40, 50, "warmUp")),
+                _repetition(4200, 5400, 5, [
+                    _step("VT-2", 220, 90, 92, "active"),
+                    _step("Vo2", 20, 110, 120, "rest"),
+                ]),
+                _single(5400, 6600, _step("Easy", 1200, 40, 50, "warmUp")),
+                _repetition(6600, 7800, 5, [
+                    _step("VT-2", 220, 90, 92, "active"),
+                    _step("Vo2", 20, 110, 120, "rest"),
+                ]),
+                _single(7800, 9000, _step("Aerobic tail", 1200, 60, 70, "active")),
+            ],
+        }
+        out, _ = _apply_structure_overrides(structure, interval_reps={1: 0})
+        names = [b["steps"][0]["name"] for b in out["structure"]]
+        assert names == ["Aerobic", "VT-2", "Easy", "VT-2", "Aerobic tail"]
+
+    def test_interval_reps_zero_preserves_trailing_cooldown(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, _ = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, interval_reps={0: 0}
+        )
+        # INTERVAL_STRUCTURE ends warm-up, set, cool-down: the cool-down is the
+        # final block and must survive when the set is dropped.
+        names = [b["steps"][0]["name"] for b in out["structure"]]
+        assert names == ["Warm up", "Cool down"]
+
+    def test_interval_reps_and_duration_applies_reps_first(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, interval_reps={0: 3}, endurance_minutes=30
+        )
+        blocks = out["structure"]
+        assert blocks[1]["length"]["value"] == 3  # reps applied
+        assert blocks[0]["steps"][0]["length"]["value"] == 600  # warm-up anchor
+        assert blocks[2]["steps"][0]["length"]["value"] == 300  # cool-down anchor
+        assert total == 1800  # scaled to 30 min
+
+    def test_interval_reps_unknown_ordinal_noop(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, total = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, interval_reps={5: 9}
+        )
+        blocks = out["structure"]
+        assert blocks[1]["length"]["value"] == 5  # unchanged
+        assert total == 2400  # unchanged total
+
+    def test_interval_reps_leaves_non_repetition_blocks_untouched(self):
+        from tp_mcp.tools.library import _apply_structure_overrides
+        out, _ = _apply_structure_overrides(
+            self.INTERVAL_STRUCTURE, interval_reps={0: 3}
+        )
+        blocks = out["structure"]
+        assert blocks[0]["length"]["value"] == 1  # single warm-up block
+        assert blocks[2]["length"]["value"] == 1  # single cool-down block
+
+
+
+class TestScheduleWithOverrides:
+    STRUCTURED_TEMPLATE = {
+        "exerciseLibraryItemId": 10,
+        "itemName": "5x3 VO2",
+        "workoutTypeId": 2,
+        "workoutSubTypeId": 3,
+        "totalTimePlanned": 2400 / 3600,   # 0.6667h, matches the structure
+        "tssPlanned": 60.0,
+        "ifPlanned": 0.9,
+        "description": "5x3min @ 110%",
+        "structure": TestApplyStructureOverrides.INTERVAL_STRUCTURE,
+    }
+
+    async def _run(self, **kwargs):
+        import json
+
+        items_response = APIResponse(success=True, data=[self.STRUCTURED_TEMPLATE])
+        create_response = APIResponse(success=True, data={"workoutId": 999})
+        with patch("tp_mcp.tools.library.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(return_value=123)
+            mock_instance.get = AsyncMock(return_value=items_response)
+            mock_instance.post = AsyncMock(return_value=create_response)
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_schedule_library_workout("1", "10", "2026-04-01", **kwargs)
+        payload = mock_instance.post.call_args[1]["json"]
+        payload_structure = json.loads(payload["structure"])
+        return result, payload, payload_structure
+
+    @pytest.mark.asyncio
+    async def test_endurance_override_flows_into_payload(self):
+        # endurance_minutes_override=45 → 2700s → 0.75h; TSS scaled from 60.
+        result, payload, structure = await self._run(endurance_minutes_override=45)
+        assert result["success"] is True
+        # Interval reps are untouched — only the duration scales.
+        assert structure["structure"][1]["length"]["value"] == 5
+        assert payload["totalTimePlanned"] == 0.75
+        assert payload["tssPlanned"] == 67.5
+
+    @pytest.mark.asyncio
+    async def test_description_override_replaces_text(self):
+        result, payload, _ = await self._run(description_override="6x3min @ 110%")
+        assert result["success"] is True
+        assert payload["description"] == "6x3min @ 110%"
+
+    @pytest.mark.asyncio
+    async def test_no_override_copies_template_verbatim(self):
+        _, payload, structure = await self._run()
+        assert structure["structure"][1]["length"]["value"] == 5
+        assert payload["description"] == "5x3min @ 110%"
+        assert payload["tssPlanned"] == 60.0
+
+    @pytest.mark.asyncio
+    async def test_bulk_applies_override_to_every_athlete(self):
+        import json
+
+        items_response = APIResponse(success=True, data=[self.STRUCTURED_TEMPLATE])
+        with patch("tp_mcp.tools.library.TPClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.ensure_athlete_id = AsyncMock(side_effect=[111, 222])
+            mock_instance.get = AsyncMock(return_value=items_response)
+            mock_instance.post = AsyncMock(side_effect=[
+                APIResponse(success=True, data={"workoutId": 1001}),
+                APIResponse(success=True, data={"workoutId": 1002}),
+            ])
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await tp_schedule_library_workout(
+                "1", "10", "2026-04-01", athletes=["Alice", "222"],
+                endurance_minutes_override=45,
+            )
+
+        assert result.get("isError") is not True
+        payloads = [c[1]["json"] for c in mock_instance.post.call_args_list]
+        for p in payloads:
+            # Reps stay at the template's 5; only the duration is scaled.
+            assert json.loads(p["structure"])["structure"][1]["length"]["value"] == 5
+            assert p["totalTimePlanned"] == 0.75
+
+    @pytest.mark.asyncio
+    async def test_invalid_endurance_minutes_rejected(self):
+        with patch("tp_mcp.tools.library.TPClient") as mock_client:
+            result = await tp_schedule_library_workout(
+                "1", "10", "2026-04-01", endurance_minutes_override=-5,
+            )
+        assert result["isError"] is True
+        assert result["error_code"] == "VALIDATION_ERROR"
+        mock_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_interval_reps_override_flows_into_payload(self):
+        # interval_reps_override={"0": 3}: reps 5 → 3, total 2400 → 1800s (0.5h);
+        # TSS scaled proportionally from 60 (0.6667h) → 45.
+        result, payload, structure = await self._run(
+            interval_reps_override={"0": 3}
+        )
+        assert result["success"] is True
+        assert structure["structure"][1]["length"]["value"] == 3
+        assert payload["totalTimePlanned"] == 0.5
+        assert payload["tssPlanned"] == 45.0
+
+    @pytest.mark.asyncio
+    async def test_interval_reps_override_tolerates_quoted_keys(self):
+        # Models sometimes over-escape the map keys (e.g. '"0"' instead of '0').
+        # The tool must strip the extra quotes and apply the reps just the same
+        # as a clean {"0": 3}, not reject the whole override.
+        result, payload, structure = await self._run(
+            interval_reps_override={'"0"': 3}
+        )
+        assert result["success"] is True
+        assert structure["structure"][1]["length"]["value"] == 3
+        assert payload["totalTimePlanned"] == 0.5
+        assert payload["tssPlanned"] == 45.0
+
+    @pytest.mark.asyncio
+    async def test_interval_reps_and_duration_combined(self):
+        result, payload, structure = await self._run(
+            interval_reps_override={"0": 3}, endurance_minutes_override=30,
+        )
+        assert result["success"] is True
+        assert structure["structure"][1]["length"]["value"] == 3
+        assert payload["totalTimePlanned"] == 0.5  # 30 min
+
+    @pytest.mark.asyncio
+    async def test_invalid_interval_reps_rejected(self):
+        for bad in (
+            [1, 2, 3],          # non-dict
+            {"0": True},        # bool value
+            {"0": -1},          # below 0
+            {"0": 101},         # above 100
+            {"0": 3.5},         # non-integer
+            {"foo": 3},         # non-integer key
+        ):
+            with patch("tp_mcp.tools.library.TPClient") as mock_client:
+                result = await tp_schedule_library_workout(
+                    "1", "10", "2026-04-01", interval_reps_override=bad,
+                )
+            assert result["isError"] is True, bad
+            assert result["error_code"] == "VALIDATION_ERROR", bad
+            mock_client.assert_not_called()
+
+
+

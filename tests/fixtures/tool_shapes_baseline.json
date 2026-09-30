@@ -934,6 +934,7 @@
             "duration_planned": "float|null",
             "id": "str",
             "sport": "str",
+            "status": "str",
             "title": "str",
             "tss": "float",
             "tss_actual": "float",

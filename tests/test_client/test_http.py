@@ -1,12 +1,22 @@
 """Tests for HTTP client, including throttling and athlete ID caching."""
 
+import asyncio
 import time
+from datetime import date, timedelta
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
+from tp_mcp.client import http as http_mod
 from tp_mcp.client.http import MIN_REQUEST_INTERVAL, APIResponse, TPClient
+
+
+def _past_range() -> str:
+    """A workout date range wholly in the past (so it is cacheable)."""
+    end = date.today() - timedelta(days=1)
+    start = end - timedelta(days=30)
+    return f"{start.isoformat()}/{end.isoformat()}"
 
 
 class TestThrottling:
@@ -226,3 +236,377 @@ class TestForbiddenEndpoints:
         # get_raw() is guarded too.
         rr = await client.get_raw("/plans/v1/commands/applyplan")
         assert rr.is_error and rr.error_code == ErrorCode.FORBIDDEN_ENDPOINT
+
+
+class TestResponseCache:
+    """Tests for the GET TTL cache + in-flight coalescing (options 1 & 2)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self, monkeypatch):
+        """Fresh response cache and caching enabled for each test."""
+        monkeypatch.setattr(http_mod, "CACHE_DISABLED", False)
+        TPClient._shared_response_cache = None
+        yield
+        TPClient._shared_response_cache = None
+
+    @pytest.mark.asyncio
+    async def test_repeat_get_served_from_cache(self):
+        """A second identical GET is a HIT and does not re-hit the API."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data={"v": 1})
+        )
+
+        first = await client.get("/exerciselibrary/v2/libraries/3820613/items")
+        second = await client.get("/exerciselibrary/v2/libraries/3820613/items")
+
+        assert first.data == {"v": 1}
+        assert second.data == {"v": 1}
+        client._request.assert_awaited_once()  # only the MISS hit the API
+
+    @pytest.mark.asyncio
+    async def test_distinct_params_are_separate_keys(self):
+        """Different query params are cached independently."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data={"ok": True})
+        )
+
+        await client.get("/x", params={"a": 1})
+        await client.get("/x", params={"a": 2})
+
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_expired_entry_refetches(self):
+        """An entry past its TTL is a MISS and refetches."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data={"v": 1})
+        )
+
+        await client.get(f"/workouts/{_past_range()}")
+        # Force the stored entry to have already expired.
+        cache = TPClient._get_response_cache()
+        for entry in cache._entries.values():
+            entry.expires_at = time.monotonic() - 1
+
+        await client.get(f"/workouts/{_past_range()}")
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_response_not_cached(self):
+        """Errors are never cached; the next call retries."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=False, message="boom")
+        )
+
+        await client.get("/settings")
+        await client.get("/settings")
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_concurrent_gets_are_coalesced(self):
+        """Concurrent identical GETs share a single in-flight request."""
+        client = TPClient()
+        release = asyncio.Event()
+        calls = 0
+
+        async def slow_request(method, endpoint, **kwargs):
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return APIResponse(success=True, data={"calls": calls})
+
+        client._request = slow_request
+
+        t1 = asyncio.create_task(client.get("/users/v3/user"))
+        t2 = asyncio.create_task(client.get("/users/v3/user"))
+        await asyncio.sleep(0.01)  # let both reach the in-flight point
+        release.set()
+        r1, r2 = await asyncio.gather(t1, t2)
+
+        assert calls == 1  # coalesced into one API call
+        assert r1.data == r2.data == {"calls": 1}
+
+    @pytest.mark.asyncio
+    async def test_write_invalidates_same_athlete_cache(self):
+        """A write to an athlete's path drops that athlete's cached GETs."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data={"v": 1})
+        )
+
+        endpoint = f"/fitness/v6/athletes/1402240/workouts/{_past_range()}"
+        await client.get(endpoint)  # MISS → cached
+        await client.get(endpoint)  # HIT
+        assert client._request.await_count == 1
+
+        # Writing a workout for the same athlete invalidates the cached read.
+        await client.post("/fitness/v6/athletes/1402240/workouts", json={})
+        await client.get(endpoint)  # MISS again
+        assert client._request.await_count == 3  # 1 read + 1 write + 1 refetch
+
+    @pytest.mark.asyncio
+    async def test_write_leaves_other_athlete_cache_intact(self):
+        """Invalidation is scoped to the written athlete only."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data={"v": 1})
+        )
+
+        other = f"/fitness/v6/athletes/999/workouts/{_past_range()}"
+        await client.get(other)  # cache athlete 999
+        await client.post("/fitness/v6/athletes/1402240/workouts", json={})
+        await client.get(other)  # still a HIT — untouched
+        assert client._request.await_count == 2  # 1 read + 1 write, no refetch
+
+    @pytest.mark.asyncio
+    async def test_cache_disabled_bypasses(self, monkeypatch):
+        """With caching disabled every GET hits the API."""
+        monkeypatch.setattr(http_mod, "CACHE_DISABLED", True)
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data={"v": 1})
+        )
+
+        await client.get("/settings")
+        await client.get("/settings")
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_inflight_read_not_cached_when_write_lands_midflight(self):
+        """A GET in flight when a write invalidates it must not cache its stale
+        result, and a reader arriving after the write must refetch."""
+        client = TPClient()
+        endpoint = f"/fitness/v6/athletes/1402240/workouts/{_past_range()}"
+        release = asyncio.Event()
+        reads = 0
+
+        async def gated_read(method, ep, **kwargs):
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                await release.wait()  # hold the first read in flight
+            return APIResponse(success=True, data={"read": reads})
+
+        client._request = gated_read
+
+        leader = asyncio.create_task(client.get(endpoint))
+        await asyncio.sleep(0.01)  # ensure the leader is in flight
+
+        # A write for the same athlete lands while the read is in flight.
+        client._invalidate_cache_after_write(
+            "/fitness/v6/athletes/1402240/workouts"
+        )
+
+        release.set()
+        await leader
+
+        # The pre-write read must not have been cached: a fresh GET refetches.
+        result = await client.get(endpoint)
+        assert reads == 2
+        assert result.data == {"read": 2}
+
+    @pytest.mark.asyncio
+    async def test_write_bumps_generation(self):
+        """Each write advances the invalidation generation counter."""
+        client = TPClient()
+        cache = TPClient._get_response_cache()
+        start = cache.generation
+        client._invalidate_cache_after_write("/fitness/v6/athletes/1402240/workouts")
+        assert cache.generation == start + 1
+
+    @pytest.mark.asyncio
+    async def test_leader_refetches_when_write_straddles_its_read(self):
+        """A write landing mid-flight makes the leader's own response stale, so
+        the leader must re-read and RETURN post-write data."""
+        client = TPClient()
+        endpoint = f"/fitness/v6/athletes/1402240/workouts/{_past_range()}"
+        release = asyncio.Event()
+        reads = 0
+
+        async def gated_read(method, ep, **kwargs):
+            nonlocal reads
+            reads += 1
+            n = reads
+            if n == 1:
+                await release.wait()  # hold the first read in flight
+            return APIResponse(success=True, data={"present": n == 1, "read": n})
+
+        client._request = gated_read
+
+        leader = asyncio.create_task(client.get(endpoint))
+        await asyncio.sleep(0.01)  # ensure the leader is in flight
+        client._invalidate_cache_after_write(
+            "/fitness/v6/athletes/1402240/workouts/999"
+        )
+        release.set()
+
+        result = await leader
+        assert result.data == {"present": False, "read": 2}
+        assert reads == 2
+
+    @pytest.mark.asyncio
+    async def test_coalesced_waiter_refetches_when_write_straddles_read(self):
+        """A waiter coalesced onto an in-flight read BEFORE a write lands must
+        not receive the leader's stale pre-write response."""
+        client = TPClient()
+        endpoint = f"/fitness/v6/athletes/1402240/workouts/{_past_range()}"
+        release = asyncio.Event()
+        reads = 0
+
+        async def gated_read(method, ep, **kwargs):
+            nonlocal reads
+            reads += 1
+            n = reads
+            if n == 1:
+                await release.wait()  # hold the leader in flight
+            return APIResponse(success=True, data={"present": n == 1, "read": n})
+
+        client._request = gated_read
+
+        leader = asyncio.create_task(client.get(endpoint))
+        await asyncio.sleep(0.01)  # leader in flight
+        waiter = asyncio.create_task(client.get(endpoint))  # COALESCES onto leader
+        await asyncio.sleep(0.01)
+        client._invalidate_cache_after_write(
+            "/fitness/v6/athletes/1402240/workouts/999"
+        )
+        release.set()
+
+        leader_res, waiter_res = await asyncio.gather(leader, waiter)
+        assert leader_res.data["present"] is False
+        assert waiter_res.data["present"] is False
+
+    @pytest.mark.asyncio
+    async def test_past_workout_range_is_cached(self):
+        """A wholly-past workout range is cacheable (second GET is a HIT)."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = f"/fitness/v6/athletes/1/workouts/{_past_range()}"
+        await client.get(endpoint)  # MISS -> cached
+        await client.get(endpoint)  # HIT
+        assert client._request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_today_workout_range_not_cached(self):
+        """A range whose end is TODAY is never cached (today is mutable)."""
+        today = date.today()
+        start = (today - timedelta(days=5)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = f"/fitness/v6/athletes/1/workouts/{start}/{today.isoformat()}"
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_future_workout_range_not_cached(self):
+        """A range extending into the future is never cached."""
+        today = date.today()
+        start = (today - timedelta(days=5)).isoformat()
+        end = (today + timedelta(days=10)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = f"/fitness/v6/athletes/1/workouts/{start}/{end}"
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_single_past_workout_is_cached(self):
+        """A single workout dated in the past is cacheable."""
+        past = (date.today() - timedelta(days=10)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(
+                success=True,
+                data={"workoutId": 1, "workoutDay": f"{past}T00:00:00"},
+            )
+        )
+        endpoint = "/fitness/v6/athletes/1/workouts/1"
+        await client.get(endpoint)  # MISS -> cached
+        await client.get(endpoint)  # HIT
+        assert client._request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_single_future_workout_not_cached(self):
+        """A single workout dated today/future is never cached."""
+        future = (date.today() + timedelta(days=1)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(
+                success=True,
+                data={"workoutId": 2, "workoutDay": f"{future}T00:00:00"},
+            )
+        )
+        endpoint = "/fitness/v6/athletes/1/workouts/2"
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_future_events_range_not_cached(self):
+        """An events range extending into the future is never cached."""
+        today = date.today()
+        start = (today - timedelta(days=30)).isoformat()
+        end = (today + timedelta(days=7)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = f"/fitness/v6/athletes/1402240/events/{start}/{end}"
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_past_events_range_is_cached(self):
+        """A wholly-past events range is cacheable."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = f"/fitness/v6/athletes/1402240/events/{_past_range()}"
+        await client.get(endpoint)  # MISS -> cached
+        await client.get(endpoint)  # HIT
+        assert client._request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_next_planned_event_not_cached(self):
+        """The next planned event is future by nature and must not be cached."""
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data={"eventId": 9})
+        )
+        endpoint = "/fitness/v6/athletes/1402240/events/nextplannedevent"
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_future_metrics_range_not_cached(self):
+        """PMC/metrics ranges into the future are not cached."""
+        today = date.today()
+        start = (today - timedelta(days=10)).isoformat()
+        end = (today + timedelta(days=10)).isoformat()
+        client = TPClient()
+        client._request = AsyncMock(
+            return_value=APIResponse(success=True, data=[])
+        )
+        endpoint = (
+            f"/metrics/v3/athletes/1402240/consolidatedtimedmetrics/{start}/{end}"
+        )
+        await client.get(endpoint)
+        await client.get(endpoint)
+        assert client._request.await_count == 2
+
+

@@ -87,6 +87,58 @@ class TestWorkoutSummary:
         assert workout.workout_status == "planned"
         assert workout.sport is None  # no type id present
 
+    def test_completed_via_actual_tss_without_flag(self):
+        """A session with an actual TSS but no ``completed`` flag / duration is
+        still completed — TrainingPeaks does not always set ``completed`` on
+        auto-synced or partially-paired activities, yet real load means it was
+        done. It must NOT be reported as missed (DNS)."""
+        data = {
+            "workoutId": 1003,
+            "workoutDay": "2025-01-05",
+            "title": "Easy",
+            "workoutTypeValueId": 2,  # Bike
+            "tssActual": 60,
+            # no "completed", no "totalTime"
+        }
+        workout = WorkoutSummary.model_validate(data)
+
+        assert workout.is_completed is True
+        assert workout.workout_status == "completed"
+        # Even though the day is in the PAST, it is completed, not missed.
+        assert workout.compliance_status(date(2025, 6, 1)) == "completed"
+
+    def test_completed_via_actual_distance_without_flag(self):
+        """An actual distance is likewise proof of execution."""
+        data = {
+            "workoutId": 1004,
+            "workoutDay": "2025-01-05",
+            "title": "Easy",
+            "workoutTypeValueId": 2,
+            "distance": 42000,  # actual distance in metres
+        }
+        workout = WorkoutSummary.model_validate(data)
+
+        assert workout.is_completed is True
+        assert workout.compliance_status(date(2025, 6, 1)) == "completed"
+
+    def test_past_planned_without_any_actual_is_missed(self):
+        """A genuinely empty past session (no flag, no duration, no TSS, no
+        distance) stays missed — only real recorded data flips it to done."""
+        data = {
+            "workoutId": 1005,
+            "workoutDay": "2025-01-05",
+            "title": "Easy",
+            "workoutTypeValueId": 2,
+            "totalTimePlanned": 3600,
+            "tssPlanned": 50,  # planned only — never executed
+        }
+        workout = WorkoutSummary.model_validate(data)
+
+        assert workout.is_completed is False
+        assert workout.compliance_status(date(2025, 6, 1)) == "missed"
+        # A future day with the same emptiness is still planned, not missed.
+        assert workout.compliance_status(date(2025, 1, 1)) == "planned"
+
 
 class TestWorkoutDetail:
     """Tests for WorkoutDetail model."""
